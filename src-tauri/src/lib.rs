@@ -1,7 +1,11 @@
+mod agent;
 mod trim;
 
-use tauri::AppHandle;
+use std::sync::Arc;
+
+use serde_json::Value;
 use tauri::ipc::Response;
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
 
@@ -9,6 +13,16 @@ fn ffmpeg(app: &AppHandle) -> Result<tauri_plugin_shell::process::Command, Strin
     app.shell()
         .sidecar("ffmpeg")
         .map_err(|e| format!("Could not find bundled ffmpeg: {e}"))
+}
+
+/// Runs the bundled ffmpeg to completion, returning (success, stderr).
+pub(crate) async fn run_ffmpeg<S: AsRef<std::ffi::OsStr>>(app: &AppHandle, args: &[S]) -> Result<(bool, String), String> {
+    let output = ffmpeg(app)?
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+    Ok((output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned()))
 }
 
 /// Decodes the file and returns its waveform: a u32 LE sample count (at
@@ -50,18 +64,26 @@ async fn load_waveform(app: AppHandle, path: String) -> Result<Response, String>
 async fn export_file(app: AppHandle, req: trim::ExportRequest) -> Result<Vec<String>, String> {
     let mut outputs = vec![];
     for job in trim::plan(&req)? {
-        let output = ffmpeg(&app)?
-            .args(&job.args)
-            .output()
-            .await
-            .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
-        if !output.status.success() {
-            let log = String::from_utf8_lossy(&output.stderr);
+        let (ok, log) = run_ffmpeg(&app, &job.args).await?;
+        if !ok {
             return Err(format!("ffmpeg failed:\n{}", trim::tail(&log, 6)));
         }
         outputs.push(job.output.to_string_lossy().into_owned());
     }
     Ok(outputs)
+}
+
+/// The UI's answer to an `agent-request` event.
+#[tauri::command]
+fn agent_respond(bridge: State<Arc<agent::Bridge>>, id: u64, ok: bool, result: Value) {
+    let result = if ok { Ok(result) } else { Err(result.as_str().map(String::from).unwrap_or_else(|| result.to_string())) };
+    bridge.respond(id, result);
+}
+
+/// The MCP server URL, or an error explaining why agents can't connect.
+#[tauri::command]
+fn agent_status(bridge: State<Arc<agent::Bridge>>) -> Result<String, String> {
+    bridge.status()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -70,7 +92,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![load_waveform, export_file])
+        .setup(|app| {
+            let bridge = Arc::new(agent::Bridge::new(app.handle().clone()));
+            app.manage(bridge.clone());
+            tauri::async_runtime::spawn(agent::serve(bridge));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![load_waveform, export_file, agent_respond, agent_status])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

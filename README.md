@@ -12,6 +12,45 @@ Grab the latest build from [Releases](../../releases) (or the artifacts of the l
 
 FFmpeg is bundled inside the app; nothing else needs installing.
 
+## Use with AI agents (MCP)
+
+While the app is open it runs an [MCP](https://modelcontextprotocol.io) server at `http://127.0.0.1:39231/mcp`
+(Streamable HTTP, localhost only). Agents edit the same editor you see: their cuts appear live on the waveform and you
+can undo them like your own.
+
+**Claude Code**
+
+```sh
+claude mcp add --transport http audio-trimmer http://127.0.0.1:39231/mcp
+```
+
+(The *Copy Claude Code command* button in the app's sidebar copies this.)
+
+**Claude Desktop, or clients that only support stdio servers**: bridge with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "audio-trimmer": { "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:39231/mcp"] }
+  }
+}
+```
+
+Then ask things like *"Open ~/Downloads/podcast.mp3, remove the long silences and export it as MP3"*.
+
+| Tool | What it does |
+|---|---|
+| `list_files`, `open_files` | See or open files in the app |
+| `analyze_audio` | Loudness timeline, silences and quiet sections (agents can't listen, so this is how they find structure) |
+| `get_edit` | Current cuts and parts |
+| `add_cuts`, `remove_cut` | Place or delete cut points |
+| `remove_range`, `keep_only_range` | Remove a range, or keep only a range |
+| `set_part_removed` | Remove or restore one part |
+| `undo`, `clear_edits` | Undo the last edit, or start over |
+| `export` | Write the kept parts (joined or one file per part); never overwrites |
+
+The server only accepts connections from this machine and rejects requests from web pages, so websites can't drive the app.
+
 ## Setup
 
 ```sh

@@ -1,7 +1,7 @@
 //! Pure logic: waveform peak reduction and turning an edit into ffmpeg invocations.
 //! Nothing here touches the filesystem except checking for existing output names.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -102,6 +102,163 @@ impl PeakAccumulator {
         self.out[..4].copy_from_slice(&self.samples.to_le_bytes());
         self.out
     }
+}
+
+/// Loudness profile of a file, built from ffmpeg `astats` + `silencedetect` output.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Analysis {
+    pub duration: f64,
+    pub window_seconds: f64,
+    /// RMS level per window in dBFS (silence is reported as -99).
+    pub loudness_db: Vec<f64>,
+    pub mean_db: f64,
+    pub median_db: f64,
+    /// Ranges below the silence threshold.
+    pub silences: Vec<Range>,
+    /// Stretches of at least 2 s that are 1.5 dB+ quieter than the median, e.g. intros,
+    /// breakdowns, pauses. Small level differences matter in heavily compressed music.
+    pub quiet_sections: Vec<Range>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone, Copy)]
+pub struct Range {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Most windows we return, so long files don't flood an agent's context.
+const MAX_WINDOWS: usize = 1200;
+const SILENT_DB: f64 = -99.0;
+const QUIET_BELOW_MEDIAN_DB: f64 = 1.5;
+const MIN_QUIET_SECONDS: f64 = 2.0;
+/// Loudness is smoothed over this span before finding quiet sections, and quiet
+/// sections closer together than this are merged, so beat-level wobble doesn't fragment them.
+const QUIET_SMOOTHING_SECONDS: f64 = 3.0;
+
+/// Loudness is always measured at this step; the reported timeline is coarsened from it.
+const ANALYSIS_STEP: f64 = 0.5;
+
+/// The ffmpeg filter chain whose log output `parse_analysis` understands.
+pub fn analysis_filter(silence_db: f64, min_silence: f64) -> String {
+    let n = (ANALYSIS_STEP * WAVEFORM_RATE as f64) as usize;
+    format!(
+        "aresample={WAVEFORM_RATE},silencedetect=n={silence_db}dB:d={min_silence},\
+         asetnsamples=n={n}:p=0,astats=metadata=1:reset=1,\
+         ametadata=print:key=lavfi.astats.Overall.RMS_level"
+    )
+}
+
+/// Parses `analysis_filter` output; the loudness timeline is reported in `window_seconds` steps.
+pub fn parse_analysis(log: &str, window_seconds: f64) -> Analysis {
+    let mut loudness = vec![];
+    let mut silences = vec![];
+    let mut silence_start = None;
+    let mut decoded = None;
+    for line in log.lines() {
+        // ffmpeg's progress lines ("... time=00:03:53.79 ...") end with the exact decoded length.
+        if let Some((_, rest)) = line.rsplit_once("time=") {
+            decoded = rest.split_whitespace().next().and_then(|t| parse_clock(t)).or(decoded);
+        }
+        if let Some((_, v)) = line.split_once("lavfi.astats.Overall.RMS_level=") {
+            loudness.push(v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(SILENT_DB).max(SILENT_DB));
+        } else if let Some((_, v)) = line.split_once("silence_start: ") {
+            silence_start = v.trim().parse::<f64>().ok();
+        } else if let Some((_, v)) = line.split_once("silence_end: ") {
+            let end = v.split('|').next().and_then(|e| e.trim().parse::<f64>().ok());
+            if let (Some(start), Some(end)) = (silence_start.take(), end) {
+                silences.push(Range { start: start.max(0.0), end });
+            }
+        }
+    }
+
+    let fine = loudness;
+    // Coarsen to the requested window (in the power domain), and to at most MAX_WINDOWS.
+    let group = ((window_seconds / ANALYSIS_STEP).round() as usize).max(fine.len().div_ceil(MAX_WINDOWS)).max(1);
+    let window = ANALYSIS_STEP * group as f64;
+    let loudness: Vec<f64> = fine
+        .chunks(group)
+        .map(|c| {
+            let power = c.iter().map(|db| 10f64.powf(db / 10.0)).sum::<f64>() / c.len() as f64;
+            round1((10.0 * power.log10()).max(SILENT_DB))
+        })
+        .collect();
+    let duration = round3(decoded.unwrap_or(fine.len() as f64 * ANALYSIS_STEP));
+    if let (Some(start), true) = (silence_start, duration > 0.0) {
+        silences.push(Range { start, end: duration });
+    }
+
+    let mut audible: Vec<f64> = fine.iter().copied().filter(|&db| db > SILENT_DB).collect();
+    audible.sort_by(f64::total_cmp);
+    let (mean_db, median_db) = if audible.is_empty() {
+        (SILENT_DB, SILENT_DB)
+    } else {
+        let mean = 10.0 * (audible.iter().map(|db| 10f64.powf(db / 10.0)).sum::<f64>() / audible.len() as f64).log10();
+        (round1(mean), round1(audible[audible.len() / 2]))
+    };
+
+    let quiet_sections = quiet_sections(&fine, ANALYSIS_STEP, median_db - QUIET_BELOW_MEDIAN_DB, duration);
+
+    Analysis { duration, window_seconds: round3(window), loudness_db: loudness, mean_db, median_db, silences, quiet_sections }
+}
+
+/// Finds stretches whose smoothed loudness is below `threshold_db`.
+fn quiet_sections(loudness: &[f64], window: f64, threshold_db: f64, duration: f64) -> Vec<Range> {
+    let half = ((QUIET_SMOOTHING_SECONDS / window / 2.0).floor() as usize).min(loudness.len());
+    let power: Vec<f64> = loudness.iter().map(|db| 10f64.powf(db / 10.0)).collect();
+    let smoothed = (0..loudness.len()).map(|i| {
+        let around = &power[i.saturating_sub(half)..(i + half + 1).min(power.len())];
+        10.0 * (around.iter().sum::<f64>() / around.len() as f64).log10()
+    });
+
+    let mut sections: Vec<Range> = vec![];
+    let mut run_start = None;
+    for (i, db) in smoothed.chain([f64::INFINITY]).enumerate() {
+        match (db < threshold_db, run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(mut s)) => {
+                // Smoothing blurs edges; tighten them back to where the raw level is quiet.
+                let mut e = i;
+                while s < e && loudness[s] >= threshold_db {
+                    s += 1;
+                }
+                while e > s && loudness[e - 1] >= threshold_db {
+                    e -= 1;
+                }
+                run_start = None;
+                if s == e {
+                    continue;
+                }
+                let (start, end) = (s as f64 * window, (e as f64 * window).min(duration));
+                match sections.last_mut() {
+                    Some(prev) if start - prev.end <= QUIET_SMOOTHING_SECONDS => prev.end = end,
+                    _ => sections.push(Range { start, end }),
+                }
+            }
+            _ => {}
+        }
+    }
+    sections
+        .into_iter()
+        .filter(|r| r.end - r.start >= MIN_QUIET_SECONDS)
+        .map(|r| Range { start: round3(r.start), end: round3(r.end) })
+        .collect()
+}
+
+/// Parses ffmpeg's "HH:MM:SS.xx" clock format.
+fn parse_clock(text: &str) -> Option<f64> {
+    let mut total = 0.0;
+    for part in text.split(':') {
+        total = total * 60.0 + part.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)?;
+    }
+    Some(total)
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
 }
 
 pub fn tail(text: &str, lines: usize) -> String {
@@ -317,6 +474,42 @@ mod tests {
         assert!(plan(&req(vec![], true)).is_err());
         assert!(plan(&req(vec![seg(10.0, Some(5.0))], true)).is_err());
         assert!(plan(&req(vec![seg(0.0, None), seg(10.0, Some(20.0))], false)).is_err());
+    }
+
+    #[test]
+    fn parses_analysis_log() {
+        // Each RMS line is one 0.5 s analysis step.
+        let rms = |db: &str| format!("frame:0 pts:0 pts_time:0\nlavfi.astats.Overall.RMS_level={db}\n");
+        let mut log = String::from("[silencedetect @ 0x1] silence_start: 0\n");
+        log += &rms("-inf");
+        log += "[silencedetect @ 0x1] silence_end: 0.4 | silence_duration: 0.4\n";
+        // 19 s loud, an 8 s breakdown with one louder beat in it, then 20 s loud.
+        let levels = [vec!["-12.0"; 37], vec!["-30.0"; 6], vec!["-14.0"; 2], vec!["-30.0"; 8], vec!["-12.0"; 40]].concat();
+        for db in &levels {
+            log += &rms(db);
+        }
+        log += "[silencedetect @ 0x1] silence_start: 46.9\n";
+        log += "size=N/A time=00:00:46.95 bitrate=N/A speed= 500x\n";
+
+        let a = parse_analysis(&log, 1.0);
+        assert_eq!(a.window_seconds, 1.0);
+        assert_eq!(a.loudness_db.len(), 47);
+        assert_eq!(&a.loudness_db[..3], &[-15.0, -12.0, -12.0]);
+        assert_eq!(a.duration, 46.95);
+        assert_eq!(a.silences, vec![Range { start: 0.0, end: 0.4 }, Range { start: 46.9, end: 46.95 }]);
+        assert_eq!(a.median_db, -12.0);
+        // The breakdown is one section despite the louder beat; the 0.5 s silent intro is too short.
+        assert_eq!(a.quiet_sections, vec![Range { start: 19.0, end: 27.0 }]);
+    }
+
+    #[test]
+    fn analysis_merges_long_files() {
+        // 2400 steps of 0.5 s = 20 minutes; at most 1200 windows come back.
+        let log: String = (0..2400).map(|_| "lavfi.astats.Overall.RMS_level=-20\n").collect();
+        let a = parse_analysis(&log, 0.5);
+        assert_eq!(a.loudness_db.len(), 1200);
+        assert_eq!(a.window_seconds, 1.0);
+        assert_eq!(a.duration, 1200.0);
     }
 
     /// Runs the planned commands with the real sidecar binary.

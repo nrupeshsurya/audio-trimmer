@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import Icon, { IconName } from "./components/Icon";
+import AgentPanel from "./components/AgentPanel";
 import TimeInput from "./components/TimeInput";
 import Waveform, { Range } from "./components/Waveform";
 import * as E from "./lib/edit";
 import { formatTime } from "./lib/time";
+import { AgentRequest, handleAgentRequest } from "./lib/agent";
 import "./App.css";
 
 const AUDIO_EXTENSIONS = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif"];
@@ -24,13 +27,20 @@ type ExportStatus =
   | { state: "done"; outputs: string[] }
   | { state: "error"; message: string };
 
-interface History {
+interface ExportOptions {
+  join: boolean;
+  format: string;
+  outputDir: string;
+  precise: boolean;
+}
+
+export interface History {
   past: E.Edit[];
   present: E.Edit;
   future: E.Edit[];
 }
 
-const freshHistory = (): History => ({ past: [], present: E.EMPTY_EDIT, future: [] });
+export const freshHistory = (): History => ({ past: [], present: E.EMPTY_EDIT, future: [] });
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
@@ -76,7 +86,9 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [dragging, setDragging] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const requested = useRef(new Set<string>());
+  /** Waveform loads by path, so agent calls can wait for a file to finish loading. */
+  const loads = useRef(new Map<string, Promise<{ peaks: Uint8Array; duration: number }>>());
+  const [agentActivity, setAgentActivity] = useState<string | null>(null);
 
   const data = active ? audio[active] : undefined;
   const ready = data?.state === "ready" ? data : null;
@@ -100,10 +112,11 @@ export default function App() {
     setActive((a) => a ?? paths[0]);
     setHistories((h) => ({ ...h, ...Object.fromEntries(paths.filter((p) => !h[p]).map((p) => [p, freshHistory()])) }));
     for (const path of paths) {
-      if (requested.current.has(path)) continue;
-      requested.current.add(path);
+      if (loads.current.has(path)) continue;
+      const load = loadWaveform(path);
+      loads.current.set(path, load);
       setAudio((a) => ({ ...a, [path]: { state: "loading" } }));
-      loadWaveform(path).then(
+      load.then(
         (d) => setAudio((a) => ({ ...a, [path]: { state: "ready", ...d } })),
         (e) => setAudio((a) => ({ ...a, [path]: { state: "error", message: String(e?.message ?? e) } })),
       );
@@ -280,27 +293,76 @@ export default function App() {
 
   // ---- Export ----
 
-  const exportFile = async (path: string) => {
-    const d = audio[path];
-    const h = histories[path];
-    if (d?.state !== "ready" || !h) return;
-    const segments = E.keptSegments(h.present, d.duration, join);
+  const settings: ExportOptions = { join, format, outputDir, precise };
+
+  /** Exports one file and records its status; returns the written paths or throws. */
+  const exportFile = async (path: string, edit: E.Edit, duration: number, opts: ExportOptions) => {
+    const segments = E.keptSegments(edit, duration, opts.join);
     setExports((s) => ({ ...s, [path]: { state: "running" } }));
     try {
-      const outputs = await invoke<string[]>("export_file", {
-        req: { input: path, segments, join, outputDir, format, precise },
-      });
+      const outputs = await invoke<string[]>("export_file", { req: { input: path, segments, ...opts } });
       setExports((s) => ({ ...s, [path]: { state: "done", outputs } }));
+      return outputs;
     } catch (e) {
       setExports((s) => ({ ...s, [path]: { state: "error", message: String(e) } }));
+      throw e;
     }
   };
 
   const exportMany = async (paths: string[]) => {
     setExporting(true);
-    for (const p of paths) await exportFile(p);
+    for (const p of paths) {
+      const d = audio[p];
+      if (d?.state === "ready" && histories[p]) await exportFile(p, histories[p].present, d.duration, settings).catch(() => {});
+    }
     setExporting(false);
   };
+
+  // ---- AI agents (MCP) ----
+
+  // Agent calls arrive asynchronously, so they read the latest state through this ref.
+  const latest = useRef({ files, histories, settings });
+  latest.current = { files, histories, settings };
+
+  const agentHandler = useRef<(req: AgentRequest) => Promise<unknown>>(async () => null);
+  agentHandler.current = (req) =>
+    handleAgentRequest(req, {
+      files: () => latest.current.files,
+      settings: () => latest.current.settings,
+      history: (path) => latest.current.histories[path] ?? freshHistory(),
+      setHistory: (path, h) => {
+        latest.current.histories = { ...latest.current.histories, [path]: h };
+        setHistories((hs) => ({ ...hs, [path]: h }));
+      },
+      open: async (paths) => {
+        addFiles(paths);
+        setActive(paths[0]);
+        return Promise.allSettled(paths.map((p) => loads.current.get(p)!));
+      },
+      loaded: (paths) => Promise.allSettled(paths.map((p) => loads.current.get(p)!)),
+      focus: (path) => setActive(path),
+      exportFile,
+      activity: setAgentActivity,
+    });
+
+  useEffect(() => {
+    const unlisten = listen<AgentRequest>("agent-request", async ({ payload }) => {
+      try {
+        const result = await agentHandler.current(payload);
+        await invoke("agent_respond", { id: payload.id, ok: true, result: result ?? null });
+      } catch (e) {
+        await invoke("agent_respond", { id: payload.id, ok: false, result: e instanceof Error ? e.message : String(e) });
+      }
+    });
+    return () => void unlisten.then((fn) => fn());
+  }, []);
+
+  // Agent activity notes fade after a few seconds.
+  useEffect(() => {
+    if (!agentActivity) return;
+    const timer = setTimeout(() => setAgentActivity(null), 6000);
+    return () => clearTimeout(timer);
+  }, [agentActivity]);
 
   // ---- Render ----
 
@@ -357,6 +419,7 @@ export default function App() {
             })}
           </ul>
         )}
+        <AgentPanel activity={agentActivity} />
       </aside>
 
       <section className="workspace">

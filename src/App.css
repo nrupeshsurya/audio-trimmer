@@ -216,3 +216,14 @@ select:hover { border-color: var(--border-strong); }
 .pill.err { color: var(--err); background: var(--err-bg); }
 .spinner { display: inline-block; width: 10px; height: 10px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 999px; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- AI agent panel ---------- */
+
+.agent-panel { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 12px 16px 14px; border-top: 1px solid var(--border); }
+.agent-head { display: flex; align-items: center; gap: 8px; }
+.dot { width: 7px; height: 7px; border-radius: 999px; background: var(--text-faint); }
+.dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-bg); }
+.agent-url { align-self: flex-start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+.agent-copy { align-self: flex-start; margin-left: -8px; font-size: 12px; color: var(--accent); }
+.agent-activity { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); }
+.agent-error { font-size: 12px; color: var(--err); }
