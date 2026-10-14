@@ -23,7 +23,7 @@ export default function AgentPanel({ activity }: { activity: string | null }) {
 
   const copy = async () => {
     if (!status.url) return;
-    await navigator.clipboard.writeText(`claude mcp add --transport http audio-trimmer ${status.url}`);
+    await navigator.clipboard.writeText(`claude mcp add --transport http kusanagi ${status.url}`);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };

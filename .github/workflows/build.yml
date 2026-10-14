@@ -57,7 +57,7 @@ jobs:
       - name: Build app
         run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
 
-      # Give the installer a name that says which OS it's for, e.g. Audio-Trimmer-0.2.0-Windows-Setup.exe.
+      # Give the installer a name that says which OS it's for, e.g. Kusanagi-0.2.0-Windows-Setup.exe.
       - name: Collect installer
         shell: bash
         run: |
@@ -69,14 +69,14 @@ jobs:
           bundle_dir="src-tauri/target/${{ matrix.target }}/release/bundle"
           mkdir -p dist
           case "${{ matrix.os-name }}" in
-            macOS)   cp "$bundle_dir"/dmg/*.dmg "dist/Audio-Trimmer-$version-macOS.dmg" ;;
-            Windows) cp "$bundle_dir"/nsis/*-setup.exe "dist/Audio-Trimmer-$version-Windows-Setup.exe" ;;
+            macOS)   cp "$bundle_dir"/dmg/*.dmg "dist/Kusanagi-$version-macOS.dmg" ;;
+            Windows) cp "$bundle_dir"/nsis/*-setup.exe "dist/Kusanagi-$version-Windows-Setup.exe" ;;
           esac
           ls -l dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: Audio-Trimmer-${{ matrix.os-name }}
+          name: Kusanagi-${{ matrix.os-name }}
           path: dist/*
           if-no-files-found: error
 
@@ -101,7 +101,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: Audio-Trimmer-${{ matrix.os-name }}
+          name: Kusanagi-${{ matrix.os-name }}
           path: dist
 
       - name: Install and launch (Windows)
@@ -110,7 +110,7 @@ jobs:
         run: |
           $installer = Get-ChildItem dist -Filter *-Setup.exe | Select-Object -First 1
           Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
-          $dir = Get-ChildItem $env:LOCALAPPDATA, $env:ProgramFiles -Directory -Filter 'Audio Trimmer' -ErrorAction SilentlyContinue | Select-Object -First 1
+          $dir = Get-ChildItem $env:LOCALAPPDATA, $env:ProgramFiles -Directory -Filter 'Kusanagi' -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dir) { throw 'Install folder not found' }
           Get-ChildItem $dir.FullName | Format-Table Name, Length
           $app = Get-ChildItem $dir.FullName -Filter *.exe | Where-Object { $_.Name -notmatch 'uninstall|ffmpeg' } | Select-Object -First 1
@@ -120,11 +120,11 @@ jobs:
       - name: Install and launch (macOS)
         if: runner.os == 'macOS'
         run: |
-          hdiutil attach dist/*.dmg -mountpoint /Volumes/AudioTrimmer -nobrowse
-          cp -R "/Volumes/AudioTrimmer/Audio Trimmer.app" /Applications/
-          hdiutil detach /Volumes/AudioTrimmer
-          open "/Applications/Audio Trimmer.app"
-          echo "FFMPEG=/Applications/Audio Trimmer.app/Contents/MacOS/ffmpeg" >> "$GITHUB_ENV"
+          hdiutil attach dist/*.dmg -mountpoint /Volumes/Kusanagi -nobrowse
+          cp -R "/Volumes/Kusanagi/Kusanagi.app" /Applications/
+          hdiutil detach /Volumes/Kusanagi
+          open "/Applications/Kusanagi.app"
+          echo "FFMPEG=/Applications/Kusanagi.app/Contents/MacOS/ffmpeg" >> "$GITHUB_ENV"
 
       - name: Drive the app over MCP
         shell: bash
@@ -163,7 +163,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: Audio-Trimmer-*
+          pattern: Kusanagi-*
           merge-multiple: true
           path: dist
 
@@ -177,10 +177,10 @@ jobs:
 
           | | |
           |---|---|
-          | **Windows** (10 and 11) | `Audio-Trimmer-VERSION-Windows-Setup.exe`: run it to install. If Windows shows "Windows protected your PC", click **More info → Run anyway**. |
-          | **macOS** (Apple Silicon, M1 or newer) | `Audio-Trimmer-VERSION-macOS.dmg`: open it and drag the app to Applications. The first time, right-click the app → **Open**. |
+          | **Windows** (10 and 11) | `Kusanagi-VERSION-Windows-Setup.exe`: run it to install. If Windows shows "Windows protected your PC", click **More info → Run anyway**. |
+          | **macOS** (Apple Silicon, M1 or newer) | `Kusanagi-VERSION-macOS.dmg`: open it and drag the app to Applications. The first time, right-click the app → **Open**. |
 
           FFmpeg is included; nothing else needs installing. Both builds were installed and tested automatically before this release was published.
           EOF
           sed -i "s/VERSION/${GITHUB_REF_NAME#v}/g" notes.md
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Audio Trimmer $GITHUB_REF_NAME" --notes-file notes.md --verify-tag --latest
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Kusanagi $GITHUB_REF_NAME" --notes-file notes.md --verify-tag --latest

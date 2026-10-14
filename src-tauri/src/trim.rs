@@ -536,7 +536,7 @@ mod tests {
             u32::from_le_bytes(peaks[..4].try_into().unwrap()) as f64 / WAVEFORM_RATE as f64
         };
 
-        let dir = std::env::temp_dir().join(format!("audiotrimmer-e2e-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kusanagi-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("tone.wav");
         let make_tone = ["-hide_banner", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10"];

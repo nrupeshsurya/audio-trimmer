@@ -1,16 +1,18 @@
-# Audio Trimmer
+# Kusanagi
+
+*Named after the Kusanagi-no-Tsurugi, the "Grass-Cutting Sword" of Japanese legend, which cut away a burning field to save its bearer. Kusanagi cuts away the parts of your audio you don't need.*
 
 Desktop app (Tauri + React) for splitting, extracting and removing parts of audio files, using a bundled FFmpeg.
 
 ## Download
 
-Get the latest version from [Releases](https://github.com/nrupeshsurya/audio-trimmer/releases/latest):
+Get the latest version from [Releases](https://github.com/nrupeshsurya/kusanagi/releases/latest):
 
-- **Windows** (10 and 11): download `Audio-Trimmer-<version>-Windows-Setup.exe` and run it. If Windows shows
+- **Windows** (10 and 11): download `Kusanagi-<version>-Windows-Setup.exe` and run it. If Windows shows
   "Windows protected your PC", click *More info → Run anyway*.
-- **macOS** (Apple Silicon, M1 or newer): download `Audio-Trimmer-<version>-macOS.dmg`, open it and drag the app to
+- **macOS** (Apple Silicon, M1 or newer): download `Kusanagi-<version>-macOS.dmg`, open it and drag the app to
   Applications. The app isn't notarized, so the first time right-click it → *Open* (or run
-  `xattr -dr com.apple.quarantine "/Applications/Audio Trimmer.app"`).
+  `xattr -dr com.apple.quarantine "/Applications/Kusanagi.app"`).
 
 FFmpeg is bundled inside the app; nothing else needs installing.
 
@@ -23,7 +25,7 @@ can undo them like your own.
 **Claude Code**
 
 ```sh
-claude mcp add --transport http audio-trimmer http://127.0.0.1:39231/mcp
+claude mcp add --transport http kusanagi http://127.0.0.1:39231/mcp
 ```
 
 (The *Copy Claude Code command* button in the app's sidebar copies this.)
@@ -33,7 +35,7 @@ claude mcp add --transport http audio-trimmer http://127.0.0.1:39231/mcp
 ```json
 {
   "mcpServers": {
-    "audio-trimmer": { "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:39231/mcp"] }
+    "kusanagi": { "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:39231/mcp"] }
   }
 }
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for a running Audio Trimmer, driven over MCP like an AI agent would.
+"""End-to-end smoke test for a running Kusanagi, driven over MCP like an AI agent would.
 
 Generates a 20 s test file (tone, 4 s of silence, tone), then asks the app to find the
 silence, remove it and export, and checks the results with ffmpeg.
@@ -59,7 +59,7 @@ class McpClient:
         self.request("initialize", {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": {"name": "audio-trimmer-smoke-test", "version": "1"},
+            "clientInfo": {"name": "kusanagi-smoke-test", "version": "1"},
         })
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -107,7 +107,7 @@ def main() -> None:
     parser.add_argument("--wait", type=float, default=120, help="seconds to wait for the app's MCP server")
     args = parser.parse_args()
 
-    workdir = Path(args.workdir or tempfile.mkdtemp(prefix="audio-trimmer-smoke-"))
+    workdir = Path(args.workdir or tempfile.mkdtemp(prefix="kusanagi-smoke-"))
     workdir.mkdir(parents=True, exist_ok=True)
     source = workdir / "tone-gap-tone.wav"
     subprocess.run([

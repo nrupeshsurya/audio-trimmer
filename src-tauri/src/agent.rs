@@ -24,7 +24,7 @@ pub const PORT: u16 = 39231;
 const UI_TIMEOUT: Duration = Duration::from_secs(300);
 
 const INSTRUCTIONS: &str = "\
-Audio Trimmer is a desktop audio editor the user has open. Your edits appear live in their editor and they can undo them.
+Kusanagi is a desktop audio editor the user has open. Your edits appear live in their editor and they can undo them.
 
 Model: cut points divide a file into parts; each part is kept or removed. Export writes the kept parts as one joined file or one file per part. All times are in seconds.
 
@@ -263,8 +263,8 @@ impl AgentServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AgentServer {
     fn get_info(&self) -> ServerConfig {
-        let mut info = Implementation::new("audio-trimmer", env!("CARGO_PKG_VERSION"));
-        info.title = Some("Audio Trimmer".into());
+        let mut info = Implementation::new("kusanagi", env!("CARGO_PKG_VERSION"));
+        info.title = Some("Kusanagi".into());
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(info)
             .with_instructions(INSTRUCTIONS)
