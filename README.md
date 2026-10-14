@@ -4,11 +4,13 @@ Desktop app (Tauri + React) for splitting, extracting and removing parts of audi
 
 ## Download
 
-Grab the latest build from [Releases](../../releases) (or the artifacts of the latest [Build](../../actions/workflows/build.yml) run).
+Get the latest version from [Releases](https://github.com/nrupeshsurya/audio-trimmer/releases/latest):
 
-- **Windows**: run the `.exe` installer. If SmartScreen warns, click *More info → Run anyway*.
-- **macOS (Apple Silicon)**: open the `.dmg` and drag the app to Applications. The app isn't notarized, so the first time
-  macOS may refuse to open it. Right-click → *Open*, or run `xattr -dr com.apple.quarantine "/Applications/Audio Trimmer.app"`.
+- **Windows** (10 and 11): download `Audio-Trimmer-<version>-Windows-Setup.exe` and run it. If Windows shows
+  "Windows protected your PC", click *More info → Run anyway*.
+- **macOS** (Apple Silicon, M1 or newer): download `Audio-Trimmer-<version>-macOS.dmg`, open it and drag the app to
+  Applications. The app isn't notarized, so the first time right-click it → *Open* (or run
+  `xattr -dr com.apple.quarantine "/Applications/Audio Trimmer.app"`).
 
 FFmpeg is bundled inside the app; nothing else needs installing.
 
