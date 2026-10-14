@@ -23,8 +23,10 @@ All colours live as CSS variables in `:root` in `src/App.css`. Rules reference v
 
 ## Layout & spacing
 - 4px grid: use 4, 8, 12, 16, 20, 24, 32.
-- Group the flow into numbered steps (1 Files → 2 Cuts → 3 Output) so it reads top to bottom.
-- Keep the primary action pinned at the bottom of the window, always visible.
+- App layout: file sidebar on the left, the editor (toolbar → waveform → parts + export panels) on the right, and a footer spanning both.
+- The waveform is the centre of the app: direct manipulation first (click, drag, double-click, drag markers); panels and typed times are for precision.
+- Keep the primary action (Export) pinned in the footer, always visible, with a one-line status beside it.
+- Waveform colours come from tokens too (`--wave`, `--wave-played`, `--wave-removed`); canvas code reads them with `getComputedStyle`.
 - Radii: 6px controls, 10px cards, 999px pills.
 
 ## Typography

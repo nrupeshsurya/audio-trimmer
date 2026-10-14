@@ -1,28 +1,32 @@
-//! Pure planning logic: parse the user's cut list and turn it into ffmpeg invocations.
+//! Pure logic: waveform peak reduction and turning an edit into ffmpeg invocations.
 //! Nothing here touches the filesystem except checking for existing output names.
 
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Sample rate the waveform is decoded at, and how many peaks per second we keep.
+pub const WAVEFORM_RATE: usize = 8000;
+pub const PEAKS_PER_SEC: usize = 100;
+
+/// Fade applied at each join so concatenated parts don't click.
+const JOIN_FADE: f64 = 0.005;
+
+/// A kept part of the input. `end: None` means "to the end of the file".
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// Cut at points: N points -> N+1 files.
-    Split,
-    /// Keep ranges: one file per range.
-    Extract,
-    /// Delete ranges: one file with the remaining audio joined.
-    Remove,
+pub struct Segment {
+    pub start: f64,
+    pub end: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TrimRequest {
+pub struct ExportRequest {
     pub input: String,
-    pub mode: Mode,
-    /// Raw text from the UI: one point or range per line (commas also separate).
-    pub cuts: String,
+    /// Kept parts, in order.
+    pub segments: Vec<Segment>,
+    /// Join all segments into one file instead of writing one file per segment.
+    pub join: bool,
     /// Empty means "next to the input file".
     pub output_dir: String,
     /// "same" or an output extension such as "mp3", "wav", "flac", "m4a".
@@ -37,81 +41,67 @@ pub struct Job {
     pub output: PathBuf,
 }
 
-/// Parses "90", "1:30", "1:30.25" or "1:02:03.5" into seconds.
-pub fn parse_time(s: &str) -> Result<f64, String> {
-    let s = s.trim();
-    let invalid = || format!("Invalid time \"{s}\" (use e.g. 90, 1:30 or 1:02:03.5)");
-    let parts: Vec<&str> = s.split(':').collect();
-    if s.is_empty() || parts.len() > 3 {
-        return Err(invalid());
-    }
-    let mut total = 0.0;
-    for (i, part) in parts.iter().enumerate() {
-        let part = part.trim();
-        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return Err(invalid());
+/// Reduces a stream of mono s16le samples to one peak byte (0-255) per bin.
+/// The output starts with the total sample count as a little-endian u32.
+pub struct PeakAccumulator {
+    per_bin: usize,
+    in_bin: usize,
+    max: u16,
+    samples: u32,
+    carry: Option<u8>,
+    out: Vec<u8>,
+}
+
+impl PeakAccumulator {
+    pub fn new() -> Self {
+        Self {
+            per_bin: WAVEFORM_RATE / PEAKS_PER_SEC,
+            in_bin: 0,
+            max: 0,
+            samples: 0,
+            carry: None,
+            out: vec![0; 4],
         }
-        let v: f64 = part.parse().map_err(|_| invalid())?;
-        if i > 0 && v >= 60.0 {
-            return Err(invalid());
-        }
-        total = total * 60.0 + v;
     }
-    Ok(total)
-}
 
-pub fn format_time(secs: f64) -> String {
-    let ms = (secs * 1000.0).round() as u64;
-    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}.{ms:03}")
-    } else {
-        format!("{m}:{s:02}.{ms:03}")
-    }
-}
-
-fn entries(text: &str) -> impl Iterator<Item = &str> {
-    text.split(['\n', ',']).map(str::trim).filter(|l| !l.is_empty())
-}
-
-pub fn parse_points(text: &str) -> Result<Vec<f64>, String> {
-    let mut points = entries(text).map(parse_time).collect::<Result<Vec<_>, _>>()?;
-    points.sort_by(f64::total_cmp);
-    points.dedup();
-    Ok(points)
-}
-
-/// Parses "start - end" lines. `end` may be the word "end" (returned as `None`).
-pub fn parse_ranges(text: &str) -> Result<Vec<(f64, Option<f64>)>, String> {
-    entries(text)
-        .map(|line| {
-            let (a, b) = line
-                .split_once('-')
-                .ok_or_else(|| format!("Invalid range \"{line}\" (use e.g. 0:10 - 0:45)"))?;
-            let start = parse_time(a)?;
-            let end = if b.trim().eq_ignore_ascii_case("end") {
-                None
-            } else {
-                Some(parse_time(b)?)
+    pub fn push(&mut self, mut bytes: &[u8]) {
+        if let Some(lo) = self.carry.take() {
+            let Some((&hi, rest)) = bytes.split_first() else {
+                self.carry = Some(lo);
+                return;
             };
-            if end.is_some_and(|e| e <= start) {
-                return Err(format!("Range \"{line}\" ends before it starts"));
-            }
-            Ok((start, end))
-        })
-        .collect()
-}
-
-/// Extracts the duration and checks for an audio stream in `ffmpeg -i <file>` output.
-pub fn probe_duration(ffmpeg_info: &str) -> Result<Option<f64>, String> {
-    if !ffmpeg_info.contains("Audio:") {
-        return Err(format!("No audio stream found.\n{}", tail(ffmpeg_info, 3)));
+            self.sample(i16::from_le_bytes([lo, hi]));
+            bytes = rest;
+        }
+        let mut pairs = bytes.chunks_exact(2);
+        for pair in &mut pairs {
+            self.sample(i16::from_le_bytes([pair[0], pair[1]]));
+        }
+        self.carry = pairs.remainder().first().copied();
     }
-    let duration = ffmpeg_info
-        .split_once("Duration: ")
-        .and_then(|(_, rest)| rest.split(',').next())
-        .and_then(|d| parse_time(d).ok());
-    Ok(duration)
+
+    fn sample(&mut self, s: i16) {
+        self.max = self.max.max(s.unsigned_abs());
+        self.samples += 1;
+        self.in_bin += 1;
+        if self.in_bin == self.per_bin {
+            self.flush_bin();
+        }
+    }
+
+    fn flush_bin(&mut self) {
+        self.out.push((self.max >> 7).min(255) as u8);
+        self.max = 0;
+        self.in_bin = 0;
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.in_bin > 0 {
+            self.flush_bin();
+        }
+        self.out[..4].copy_from_slice(&self.samples.to_le_bytes());
+        self.out
+    }
 }
 
 pub fn tail(text: &str, lines: usize) -> String {
@@ -140,7 +130,18 @@ fn unique_path(dir: &Path, name: &str, ext: &str, taken: &mut HashSet<PathBuf>) 
     path
 }
 
-pub fn plan(req: &TrimRequest, duration: Option<f64>) -> Result<Vec<Job>, String> {
+pub fn plan(req: &ExportRequest) -> Result<Vec<Job>, String> {
+    if req.segments.is_empty() {
+        return Err("Nothing to export: every part is removed".into());
+    }
+    for (i, s) in req.segments.iter().enumerate() {
+        let bad_end = s.end.is_some_and(|e| e <= s.start);
+        let not_last_open = s.end.is_none() && i + 1 != req.segments.len();
+        if s.start < 0.0 || !s.start.is_finite() || bad_end || not_last_open {
+            return Err(format!("Invalid part {}", i + 1));
+        }
+    }
+
     let input = Path::new(&req.input);
     let stem = input
         .file_stem()
@@ -163,107 +164,60 @@ pub fn plan(req: &TrimRequest, duration: Option<f64>) -> Result<Vec<Job>, String
     } else {
         PathBuf::from(&req.output_dir)
     };
-    let past_end = |t: f64| duration.is_some_and(|d| t >= d);
-    let len_msg = || duration.map(format_time).unwrap_or_default();
     let mut taken = HashSet::new();
+    let base_args = || -> Vec<String> { vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()] };
 
-    let base = |start: f64, end: Option<f64>| {
-        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()];
-        if start > 0.0 {
-            args.extend(["-ss".into(), format!("{start:.3}")]);
-        }
-        if let Some(end) = end {
-            args.extend(["-to".into(), format!("{end:.3}")]);
-        }
-        args.extend(["-i".into(), req.input.clone()]);
-        args
-    };
-
-    let segments: Vec<(f64, Option<f64>)> = match req.mode {
-        Mode::Split => {
-            let points = parse_points(&req.cuts)?;
-            if points.is_empty() {
-                return Err("Enter at least one cut point".into());
+    if req.join && req.segments.len() > 1 {
+        let last = req.segments.len() - 1;
+        let mut filter = String::new();
+        let mut labels = String::new();
+        for (i, s) in req.segments.iter().enumerate() {
+            let end = s.end.map(|e| format!(":end={e:.3}")).unwrap_or_default();
+            filter += &format!("[0:a]atrim=start={:.3}{end},asetpts=PTS-STARTPTS", s.start);
+            if i > 0 {
+                filter += &format!(",afade=t=in:d={JOIN_FADE}");
             }
-            if let Some(&p) = points.iter().find(|&&p| p <= 0.0 || past_end(p)) {
-                return Err(format!(
-                    "Cut point {} is outside the file (length {})",
-                    format_time(p),
-                    len_msg()
-                ));
-            }
-            let mut bounds = vec![0.0];
-            bounds.extend(&points);
-            bounds
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| (s, points.get(i).copied()))
-                .collect()
-        }
-        Mode::Extract => {
-            let ranges = parse_ranges(&req.cuts)?;
-            if ranges.is_empty() {
-                return Err("Enter at least one range".into());
-            }
-            if let Some(&(s, _)) = ranges.iter().find(|(s, _)| past_end(*s)) {
-                return Err(format!(
-                    "Range starting at {} is past the end of the file (length {})",
-                    format_time(s),
-                    len_msg()
-                ));
-            }
-            ranges
-        }
-        Mode::Remove => {
-            let mut ranges = parse_ranges(&req.cuts)?;
-            if ranges.is_empty() {
-                return Err("Enter at least one range to remove".into());
-            }
-            ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
-            // Complement of the (merged) removed ranges = what we keep.
-            let mut keeps: Vec<(f64, Option<f64>)> = vec![];
-            let mut cursor = Some(0.0);
-            for (s, e) in ranges {
-                let Some(c) = cursor else { break };
-                if s > c {
-                    keeps.push((c, Some(s)));
+            if let (true, Some(e)) = (i < last, s.end) {
+                if e - s.start > 2.0 * JOIN_FADE {
+                    filter += &format!(",afade=t=out:st={:.3}:d={JOIN_FADE}", e - s.start - JOIN_FADE);
                 }
-                cursor = e.map(|e| e.max(c));
             }
-            if let Some(c) = cursor.filter(|&c| !past_end(c)) {
-                keeps.push((c, None));
-            }
-            if keeps.is_empty() {
-                return Err("Those ranges remove the whole file".into());
-            }
-            let mut filter = String::new();
-            let mut labels = String::new();
-            for (i, (s, e)) in keeps.iter().enumerate() {
-                let end = e.map(|e| format!(":end={e:.3}")).unwrap_or_default();
-                filter += &format!("[0:a]atrim=start={s:.3}{end},asetpts=PTS-STARTPTS[a{i}];");
-                labels += &format!("[a{i}]");
-            }
-            filter += &format!("{labels}concat=n={}:v=0:a=1[out]", keeps.len());
-
-            let output = unique_path(&out_dir, &format!("{stem}_trimmed"), &ext, &mut taken);
-            let mut args = base(0.0, None);
-            args.extend(["-filter_complex".into(), filter, "-map".into(), "[out]".into()]);
-            args.extend(["-map_metadata".into(), "0".into()]);
-            args.extend(codec_args(&ext, false).into_iter().map(String::from));
-            args.push(output.to_string_lossy().into_owned());
-            return Ok(vec![Job { args, output }]);
+            filter += &format!("[a{i}];");
+            labels += &format!("[a{i}]");
         }
-    };
+        filter += &format!("{labels}concat=n={}:v=0:a=1[out]", req.segments.len());
+
+        let output = unique_path(&out_dir, &format!("{stem}_edited"), &ext, &mut taken);
+        let mut args = base_args();
+        args.extend(["-i".into(), req.input.clone(), "-filter_complex".into(), filter]);
+        args.extend(["-map".into(), "[out]".into(), "-map_metadata".into(), "0".into()]);
+        args.extend(codec_args(&ext, false).into_iter().map(String::from));
+        args.push(output.to_string_lossy().into_owned());
+        return Ok(vec![Job { args, output }]);
+    }
 
     let copy = !req.precise && ext == in_ext;
-    let width = segments.len().to_string().len().max(2);
-    Ok(segments
+    let single = req.segments.len() == 1;
+    let width = req.segments.len().to_string().len().max(2);
+    Ok(req
+        .segments
         .iter()
         .enumerate()
-        .map(|(i, &(s, e))| {
-            let name = format!("{stem}_part{:0width$}", i + 1);
+        .map(|(i, s)| {
+            let name = if single {
+                format!("{stem}_edited")
+            } else {
+                format!("{stem}_part{:0width$}", i + 1)
+            };
             let output = unique_path(&out_dir, &name, &ext, &mut taken);
-            let mut args = base(s, e);
+            let mut args = base_args();
+            if s.start > 0.0 {
+                args.extend(["-ss".into(), format!("{:.3}", s.start)]);
+            }
+            if let Some(end) = s.end {
+                args.extend(["-to".into(), format!("{end:.3}")]);
+            }
+            args.extend(["-i".into(), req.input.clone()]);
             args.extend(["-map".into(), "0:a".into(), "-map_metadata".into(), "0".into()]);
             args.extend(codec_args(&ext, copy).into_iter().map(String::from));
             args.push(output.to_string_lossy().into_owned());
@@ -276,86 +230,93 @@ pub fn plan(req: &TrimRequest, duration: Option<f64>) -> Result<Vec<Job>, String
 mod tests {
     use super::*;
 
-    fn req(mode: Mode, cuts: &str) -> TrimRequest {
-        TrimRequest {
+    fn seg(start: f64, end: Option<f64>) -> Segment {
+        Segment { start, end }
+    }
+
+    fn req(segments: Vec<Segment>, join: bool) -> ExportRequest {
+        ExportRequest {
             input: "/nonexistent/dir/song.mp3".into(),
-            mode,
-            cuts: cuts.into(),
+            segments,
+            join,
             output_dir: String::new(),
             format: "same".into(),
             precise: false,
         }
     }
 
+    fn has(args: &[String], pair: [&str; 2]) -> bool {
+        args.windows(2).any(|w| w == pair)
+    }
+
     #[test]
-    fn parses_times() {
-        assert_eq!(parse_time("90").unwrap(), 90.0);
-        assert_eq!(parse_time("1:30").unwrap(), 90.0);
-        assert_eq!(parse_time("1:02:03.5").unwrap(), 3723.5);
-        assert_eq!(parse_time(" 0:05.25 ").unwrap(), 5.25);
-        for bad in ["", "1:75", "abc", "1:2:3:4", "-5", "inf", "1e3", "1::2"] {
-            assert!(parse_time(bad).is_err(), "{bad} should fail");
+    fn peaks_handle_odd_chunk_boundaries() {
+        let samples: Vec<i16> = (0..250).map(|i| if i == 100 { -32768 } else { 256 }).collect();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut acc = PeakAccumulator::new();
+        for chunk in bytes.chunks(7) {
+            acc.push(chunk);
         }
+        let out = acc.finish();
+        assert_eq!(u32::from_le_bytes(out[..4].try_into().unwrap()), 250);
+        // 80 samples per bin -> 4 bins (last one partial); the loud sample is in bin 1.
+        assert_eq!(&out[4..], &[2, 255, 2, 2]);
     }
 
     #[test]
-    fn parses_ranges() {
-        let r = parse_ranges("0:10 - 0:45\n1:20-end, 2:00 - 2:30").unwrap();
-        assert_eq!(r, vec![(10.0, Some(45.0)), (80.0, None), (120.0, Some(150.0))]);
-        assert!(parse_ranges("0:45 - 0:10").is_err());
-        assert!(parse_ranges("0:45").is_err());
-    }
-
-    #[test]
-    fn probes_duration() {
-        let info = "  Duration: 00:03:21.45, start: 0.000000, bitrate: 128 kb/s\n  Stream #0:0: Audio: mp3";
-        assert_eq!(probe_duration(info).unwrap(), Some(201.45));
-        assert!(probe_duration("song.mp3: No such file or directory").is_err());
-    }
-
-    #[test]
-    fn split_makes_n_plus_one_parts() {
-        let jobs = plan(&req(Mode::Split, "2:00\n1:00"), Some(300.0)).unwrap();
+    fn separate_parts_get_numbered_files() {
+        let r = req(vec![seg(0.0, Some(60.0)), seg(60.0, Some(120.0)), seg(120.0, None)], false);
+        let jobs = plan(&r).unwrap();
         assert_eq!(jobs.len(), 3);
         assert!(jobs[0].output.ends_with("song_part01.mp3"));
-        assert!(jobs[0].args.windows(2).any(|w| w == ["-to", "60.000"]));
+        assert!(has(&jobs[0].args, ["-to", "60.000"]));
         assert!(!jobs[0].args.contains(&"-ss".to_string()));
-        assert!(jobs[1].args.windows(2).any(|w| w == ["-ss", "60.000"]));
+        assert!(has(&jobs[1].args, ["-ss", "60.000"]));
         assert!(!jobs[2].args.contains(&"-to".to_string()));
-        assert!(jobs[2].args.windows(2).any(|w| w == ["-c:a", "copy"]));
+        assert!(has(&jobs[2].args, ["-c:a", "copy"]));
     }
 
     #[test]
-    fn split_rejects_points_past_end() {
-        assert!(plan(&req(Mode::Split, "6:00"), Some(300.0)).is_err());
+    fn single_part_is_named_edited() {
+        let jobs = plan(&req(vec![seg(5.0, Some(10.0))], true)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].output.ends_with("song_edited.mp3"));
+        assert!(has(&jobs[0].args, ["-c:a", "copy"]));
     }
 
     #[test]
     fn precise_or_format_change_reencodes() {
-        let mut r = req(Mode::Extract, "0:10 - 0:20");
+        let mut r = req(vec![seg(10.0, Some(20.0))], false);
         r.precise = true;
-        let jobs = plan(&r, Some(300.0)).unwrap();
-        assert!(jobs[0].args.contains(&"libmp3lame".to_string()));
+        assert!(plan(&r).unwrap()[0].args.contains(&"libmp3lame".to_string()));
 
-        let mut r = req(Mode::Extract, "0:10 - 0:20");
+        let mut r = req(vec![seg(10.0, Some(20.0))], false);
         r.format = "wav".into();
-        let jobs = plan(&r, Some(300.0)).unwrap();
-        assert!(jobs[0].output.ends_with("song_part01.wav"));
+        let jobs = plan(&r).unwrap();
+        assert!(jobs[0].output.ends_with("song_edited.wav"));
         assert!(!jobs[0].args.contains(&"copy".to_string()));
     }
 
     #[test]
-    fn remove_keeps_the_complement() {
-        let jobs = plan(&req(Mode::Remove, "0:00 - 0:05\n1:00 - 1:30\n1:20 - 2:00"), Some(300.0)).unwrap();
+    fn join_concats_with_fades() {
+        let jobs = plan(&req(vec![seg(5.0, Some(60.0)), seg(120.0, None)], true)).unwrap();
         assert_eq!(jobs.len(), 1);
-        let filter = &jobs[0].args[jobs[0].args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        let args = &jobs[0].args;
+        let filter = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert_eq!(
             filter,
-            "[0:a]atrim=start=5.000:end=60.000,asetpts=PTS-STARTPTS[a0];\
-             [0:a]atrim=start=120.000,asetpts=PTS-STARTPTS[a1];\
+            "[0:a]atrim=start=5.000:end=60.000,asetpts=PTS-STARTPTS,afade=t=out:st=54.995:d=0.005[a0];\
+             [0:a]atrim=start=120.000,asetpts=PTS-STARTPTS,afade=t=in:d=0.005[a1];\
              [a0][a1]concat=n=2:v=0:a=1[out]"
         );
-        assert!(jobs[0].output.ends_with("song_trimmed.mp3"));
+        assert!(jobs[0].output.ends_with("song_edited.mp3"));
+    }
+
+    #[test]
+    fn rejects_bad_segments() {
+        assert!(plan(&req(vec![], true)).is_err());
+        assert!(plan(&req(vec![seg(10.0, Some(5.0))], true)).is_err());
+        assert!(plan(&req(vec![seg(0.0, None), seg(10.0, Some(20.0))], false)).is_err());
     }
 
     /// Runs the planned commands with the real sidecar binary.
@@ -370,13 +331,16 @@ mod tests {
             .map(|e| e.unwrap().path())
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("ffmpeg-"))
             .expect("no ffmpeg sidecar found");
-        let ffmpeg_out = |args: &[String]| {
-            let out = Command::new(&ffmpeg).args(args).output().unwrap();
-            (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
-        };
+        let run = |args: &[String]| Command::new(&ffmpeg).args(args).output().unwrap();
+        // Decodes like the app's waveform loader and returns the exact duration.
         let duration_of = |path: &Path| {
-            let (_, info) = ffmpeg_out(&["-hide_banner".into(), "-i".into(), path.to_string_lossy().into()]);
-            probe_duration(&info).unwrap().unwrap()
+            let args = ["-v", "error", "-i", &path.to_string_lossy(), "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"];
+            let out = run(&args.map(String::from));
+            assert!(out.status.success());
+            let mut acc = PeakAccumulator::new();
+            acc.push(&out.stdout);
+            let peaks = acc.finish();
+            u32::from_le_bytes(peaks[..4].try_into().unwrap()) as f64 / WAVEFORM_RATE as f64
         };
 
         let dir = std::env::temp_dir().join(format!("audiotrimmer-e2e-{}", std::process::id()));
@@ -385,38 +349,28 @@ mod tests {
         let make_tone = ["-hide_banner", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10"];
         let mut make_tone: Vec<String> = make_tone.map(String::from).to_vec();
         make_tone.push(input.to_string_lossy().into());
-        assert!(ffmpeg_out(&make_tone).0);
+        assert!(run(&make_tone).status.success());
+        assert!((duration_of(&input) - 10.0).abs() < 0.001);
 
         let cases = [
-            (Mode::Split, "2.5\n0:06", "same", vec![2.5, 3.5, 4.0]),
-            (Mode::Extract, "1 - 2.5\n0:08 - end", "mp3", vec![1.5, 2.0]),
-            (Mode::Remove, "0 - 1\n4 - 6", "flac", vec![7.0]),
+            (vec![seg(0.0, Some(2.5)), seg(2.5, Some(6.0)), seg(6.0, None)], false, "same", vec![2.5, 3.5, 4.0]),
+            (vec![seg(1.0, Some(2.5)), seg(8.0, None)], false, "mp3", vec![1.5, 2.0]),
+            (vec![seg(1.0, Some(4.0)), seg(6.0, None)], true, "flac", vec![7.0]),
         ];
-        for (mode, cuts, format, expected) in cases {
-            let r = TrimRequest {
-                input: input.to_string_lossy().into(),
-                mode,
-                cuts: cuts.into(),
-                output_dir: String::new(),
-                format: format.into(),
-                precise: false,
-            };
-            let jobs = plan(&r, Some(duration_of(&input))).unwrap();
-            assert_eq!(jobs.len(), expected.len(), "{mode:?}");
+        for (segments, join, format, expected) in cases {
+            let mut r = req(segments, join);
+            r.input = input.to_string_lossy().into();
+            r.format = format.into();
+            let jobs = plan(&r).unwrap();
+            assert_eq!(jobs.len(), expected.len());
             for (job, want) in jobs.iter().zip(expected) {
-                let (ok, log) = ffmpeg_out(&job.args);
-                assert!(ok, "{mode:?} failed: {}", tail(&log, 5));
+                let out = run(&job.args);
+                assert!(out.status.success(), "{}", tail(&String::from_utf8_lossy(&out.stderr), 5));
                 let got = duration_of(&job.output);
                 // mp3 adds encoder padding of a frame or two.
-                assert!((got - want).abs() < 0.06, "{mode:?}: {} is {got}s, want {want}s", job.output.display());
+                assert!((got - want).abs() < 0.06, "{} is {got}s, want {want}s", job.output.display());
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn remove_everything_is_an_error() {
-        assert!(plan(&req(Mode::Remove, "0:00 - end"), Some(300.0)).is_err());
-        assert!(plan(&req(Mode::Remove, "0:00 - 5:00"), Some(300.0)).is_err());
     }
 }

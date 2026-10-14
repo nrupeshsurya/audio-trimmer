@@ -11,13 +11,15 @@ npm run tauri dev                # run in development
 npm run tauri build              # build the app/installer for this OS
 ```
 
-## Modes
+## Editing
 
-- **Split at points**: `1:30` per line. N cut points give N+1 files.
-- **Extract ranges**: `0:10 - 0:45` per line. Each range becomes its own file; `end` means end of file.
-- **Remove ranges**: `0:00 - 0:05` per line. The rest is joined into one file.
+Open one or more audio files, then edit each on its waveform:
 
-Times can be written as `90`, `1:30` or `1:02:03.5`.
+- **Cut**: double-click the waveform or press `C` to cut at the playhead. Cuts divide the file into parts.
+- **Remove / keep**: drag to select a range, then press `⌫` to remove it or `K` to keep only it. Each part can also be removed or restored from its chip or the parts list.
+- **Adjust**: drag cut markers, nudge the selected one with ←/→, or type exact times in the parts list.
+- **Preview**: Space plays and skips removed parts. Cmd/Ctrl + scroll zooms.
+- **Export**: kept parts are joined into one file or written as one file per part.
 
 ## Tests
 

@@ -13,16 +13,22 @@
     "windows": [
       {
         "title": "Audio Trimmer",
-        "width": 760,
-        "height": 800,
-        "minWidth": 560,
-        "minHeight": 560,
+        "width": 1180,
+        "height": 780,
+        "minWidth": 900,
+        "minHeight": 620,
         "theme": "Dark",
         "backgroundColor": "#111214"
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**"
+        ]
+      }
     }
   },
   "bundle": {

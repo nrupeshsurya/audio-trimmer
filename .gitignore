@@ -25,3 +25,6 @@ dist-ssr
 
 # Downloaded by scripts/fetch-ffmpeg.sh
 src-tauri/binaries/
+
+# Local test audio
+samples/
