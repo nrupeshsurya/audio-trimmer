@@ -43,6 +43,9 @@
     ],
     "externalBin": [
       "binaries/ffmpeg"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }
