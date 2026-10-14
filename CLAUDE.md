@@ -2,7 +2,7 @@
 
 Desktop audio cutter (Tauri 2 + React/TypeScript + Rust) with a waveform editor and a built-in MCP server so AI
 agents can drive it. FFmpeg is bundled as a Tauri sidecar. Targets: Windows x64 and macOS Apple Silicon.
-Goal: side income (see GitHub issues labelled `monetization`). Open work is tracked in GitHub issues, not here.
+Open work is tracked in GitHub issues (this repo, plus the owner's private planning repo), not here.
 
 ## Commands
 
@@ -53,8 +53,8 @@ npm run tauri build -- --bundles dmg # local release build (macOS)
 
 ## Gotchas
 
-- The bundled FFmpeg builds are GPL; fine for free distribution, but switch to an LGPL build before selling (issue).
-- Builds are unsigned: macOS users right-click → Open; Windows shows SmartScreen. Signing is tracked in an issue.
+- The bundled FFmpeg builds are GPL (see "Third-party software" in the README).
+- Builds are unsigned: macOS users right-click → Open; Windows shows SmartScreen.
 - Bundle identifier is `com.nrupesh.kusanagi`; changing it makes OSes treat the app as a new one.
 - The MCP port 39231 is fixed; if it's taken the sidebar panel shows the error instead of the URL.
 - Edition 2024 Rust: `gen` is a reserved keyword.
