@@ -1,7 +1,8 @@
 name: Build
 
-# Every push to main builds the macOS and Windows apps and attaches them to the run.
-# Pushing a tag like v0.2.0 also creates a draft GitHub Release with the installers.
+# Every push to main builds the macOS and Windows apps, installs each one on a fresh
+# runner and drives it over MCP (scripts/mcp_smoke_test.py) to check it really works.
+# Pushing a tag like v0.2.0 also creates a GitHub Release, published only if those tests pass.
 on:
   push:
     branches: [main]
@@ -63,6 +64,8 @@ jobs:
           releaseBody: |
             **Windows:** download the `.exe` (installer) or `.msi`. If SmartScreen warns, click *More info → Run anyway*.
             **macOS (Apple Silicon):** download the `.dmg`. The app isn't notarized; see the README for how to open it.
+
+            Both builds were installed and tested automatically before this release was published.
           releaseDraft: true
 
       - uses: actions/upload-artifact@v4
@@ -73,3 +76,87 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
+
+  # Install the real build, launch it, and drive it over MCP like an AI agent would.
+  smoke-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+          - name: windows-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: audio-trimmer-${{ matrix.name }}
+          path: dist
+
+      - name: Install and launch (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Recurse -Filter *-setup.exe | Select-Object -First 1
+          Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
+          $dir = Get-ChildItem $env:LOCALAPPDATA, $env:ProgramFiles -Directory -Filter 'Audio Trimmer' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dir) { throw 'Install folder not found' }
+          Get-ChildItem $dir.FullName | Format-Table Name, Length
+          $app = Get-ChildItem $dir.FullName -Filter *.exe | Where-Object { $_.Name -notmatch 'uninstall|ffmpeg' } | Select-Object -First 1
+          Start-Process -FilePath $app.FullName
+          "FFMPEG=$(Join-Path $dir.FullName 'ffmpeg.exe')" >> $env:GITHUB_ENV
+
+      - name: Install and launch (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dmg=$(find dist -name '*.dmg' | head -n1)
+          hdiutil attach "$dmg" -mountpoint /Volumes/AudioTrimmer -nobrowse
+          cp -R "/Volumes/AudioTrimmer/Audio Trimmer.app" /Applications/
+          hdiutil detach /Volumes/AudioTrimmer
+          open "/Applications/Audio Trimmer.app"
+          echo "FFMPEG=/Applications/Audio Trimmer.app/Contents/MacOS/ffmpeg" >> "$GITHUB_ENV"
+
+      - name: Drive the app over MCP
+        shell: bash
+        run: python scripts/mcp_smoke_test.py --ffmpeg "$FFMPEG" --workdir "$RUNNER_TEMP/smoke"
+
+      - name: Screenshot (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          [System.Drawing.Graphics]::FromImage($bitmap).CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
+          $bitmap.Save("$env:RUNNER_TEMP\screenshot.png")
+
+      - name: Screenshot (macOS)
+        if: always() && runner.os == 'macOS'
+        run: screencapture -x "$RUNNER_TEMP/screenshot.png" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/screenshot.png
+            ${{ runner.temp }}/smoke/out/*
+          if-no-files-found: ignore
+
+  # Tagged builds are uploaded to a draft release; publish it once both platforms pass.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

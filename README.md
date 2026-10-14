@@ -80,8 +80,13 @@ cargo test -- --ignored          # end-to-end against the real FFmpeg binary
 
 ## Releases
 
-Every push to `main` builds the Windows and macOS apps in GitHub Actions. Pushing a tag such as `v0.2.0` also creates a
-draft GitHub Release with the installers attached.
+Every push to `main` builds the Windows and macOS apps in GitHub Actions, then installs each build on a fresh machine,
+launches it, and drives it over MCP with [`scripts/mcp_smoke_test.py`](scripts/mcp_smoke_test.py): it opens a test file,
+finds and removes a silence, exports, and checks the output. Screenshots of each run are saved as artifacts.
+
+To release, bump the version in `src-tauri/tauri.conf.json` and push a matching tag (`git tag v0.2.0 && git push --tags`).
+The release is published automatically once both platforms pass. You can run the smoke test locally against a running
+app too: `python3 scripts/mcp_smoke_test.py --ffmpeg src-tauri/binaries/ffmpeg-<target>`.
 
 ## Third-party software
 
