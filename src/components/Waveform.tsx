@@ -206,7 +206,7 @@ export default function Waveform(props: Props) {
   let keptNo = 0;
 
   return (
-    <div className="waveform" ref={wrapRef}>
+    <div className="waveform" ref={wrapRef} data-tour="waveform">
       <div
         className="wave-surface"
         ref={surfaceRef}

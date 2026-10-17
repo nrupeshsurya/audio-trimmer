@@ -29,7 +29,7 @@ export default function AgentPanel({ activity }: { activity: string | null }) {
   };
 
   return (
-    <div className="agent-panel">
+    <div className="agent-panel" data-tour="agents">
       <div className="agent-head">
         <span className={`dot ${status.url ? "on" : "off"}`} />
         <h2>AI agents</h2>

@@ -7,6 +7,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import Icon, { IconName } from "./components/Icon";
 import AgentPanel from "./components/AgentPanel";
 import CombinePanel, { ClipInfo } from "./components/CombinePanel";
+import Tutorial, { tutorialDismissed } from "./components/Tutorial";
 import OutputFields from "./components/OutputFields";
 import TimeInput from "./components/TimeInput";
 import Waveform, { Range } from "./components/Waveform";
@@ -113,6 +114,7 @@ export default function App() {
   const [clips, setClips] = useState<C.CombineClip[]>([]);
   const [transition, setTransition] = useState<C.Transition>({ kind: "none", seconds: 1 });
   const [combineStatus, setCombineStatus] = useState<ExportStatus | null>(null);
+  const [showTutorial, setShowTutorial] = useState(() => !tutorialDismissed());
   const audioRef = useRef<HTMLAudioElement>(null);
   /** Waveform loads by path, so agent calls can wait for a file to finish loading. */
   const loads = useRef(new Map<string, Promise<{ peaks: Uint8Array; duration: number }>>());
@@ -319,7 +321,7 @@ export default function App() {
 
   const onKey = useRef<(e: KeyboardEvent) => void>(() => {});
   onKey.current = (e) => {
-    if (!ready || combining || (e.target instanceof Element && e.target.closest("input, textarea, select"))) return;
+    if (!ready || combining || showTutorial || (e.target instanceof Element && e.target.closest("input, textarea, select"))) return;
     const mod = e.metaKey || e.ctrlKey;
     const key = e.key.toLowerCase();
     if (mod && key === "z") {
@@ -473,12 +475,16 @@ export default function App() {
   return (
     <main className={`app ${dragging ? "dragging" : ""}`}>
       <aside className="sidebar">
-        <button className={`sidebar-nav ${combining ? "active" : ""}`} onClick={() => setView("combine")}>
+        <button className={`sidebar-nav ${combining ? "active" : ""}`} onClick={() => setView("combine")} data-tour="combine">
           <Icon name="layers" />
           <span>Combine clips</span>
           {clips.length > 0 && <span className="pill">{clips.length}</span>}
         </button>
-        <div className="sidebar-head">
+        <button className="sidebar-nav" onClick={() => setShowTutorial(true)}>
+          <Icon name="help" />
+          <span>Tutorial</span>
+        </button>
+        <div className="sidebar-head" data-tour="files">
           <h2>Files</h2>
           <button className="icon-btn" onClick={pickFiles} title="Add files">
             <Icon name="plus" />
@@ -616,7 +622,7 @@ export default function App() {
                 </p>
 
                 <div className="panels">
-                  <section className="card">
+                  <section className="card" data-tour="parts">
                     <div className="card-head">
                       <h2>Parts</h2>
                       <span className="card-sub">
@@ -716,7 +722,7 @@ export default function App() {
                 </span>
               )}
             </div>
-            <button className="primary" onClick={combineClips} disabled={exporting || !!combineProblem}>
+            <button className="primary" onClick={combineClips} data-tour="export" disabled={exporting || !!combineProblem}>
               {combineStatus?.state === "running" ? "Combining…" : "Combine"}
             </button>
           </>
@@ -739,6 +745,7 @@ export default function App() {
             )}
             <button
               className="primary"
+              data-tour="export"
               onClick={() => active && exportMany([active])}
               disabled={exporting || !ready || !E.hasChanges(edit) || kept.length === 0}
             >
@@ -747,6 +754,8 @@ export default function App() {
           </>
         )}
       </footer>
+
+      {showTutorial && <Tutorial onClose={() => setShowTutorial(false)} />}
 
       <audio
         ref={audioRef}
