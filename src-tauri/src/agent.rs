@@ -26,7 +26,7 @@ const UI_TIMEOUT: Duration = Duration::from_secs(300);
 const INSTRUCTIONS: &str = "\
 Kusanagi is a desktop audio editor the user has open. Your edits appear live in their editor and they can undo them.
 
-Model: cut points divide a file into parts; each part is kept or removed. Export writes the kept parts as one joined file or one file per part. All times are in seconds.
+Model: cut points divide a file into parts; each part is kept or removed. Export writes the kept parts as one joined file or one file per part. combine_files joins several files (or their kept parts) into one. All times are in seconds.
 
 Typical workflow:
 1. open_files (or use list_files to see what the user already has open).
@@ -156,6 +156,22 @@ pub struct ExportArgs {
     precise: Option<bool>,
 }
 
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CombineArgs {
+    /// Absolute paths of the audio files to join, in output order (at least two; a file may repeat).
+    files: Vec<String>,
+    /// true (default) to use each file's kept parts; files without edits are used whole. false uses every file whole.
+    use_edits: Option<bool>,
+    /// How clips join: "none" (default, back to back), "fade" (fade out then fade in), "crossfade" (overlap) or "gap" (silence).
+    transition: Option<String>,
+    /// Length of each fade, crossfade or gap in seconds (default 1, at most 60).
+    transition_seconds: Option<f64>,
+    /// Output format: "same" (the first file's), "mp3", "m4a", "wav" or "flac". Defaults to the app's current setting.
+    format: Option<String>,
+    /// Output folder. Defaults to the app's setting (next to the first file unless the user chose one).
+    output_dir: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentServer {
     bridge: Arc<Bridge>,
@@ -257,6 +273,13 @@ impl AgentServer {
         Only export when the user wants files written.")]
     async fn export(&self, Parameters(args): Parameters<ExportArgs>) -> CallToolResult {
         self.ui("export", args).await
+    }
+
+    #[tool(description = "Join several files (or their kept parts) into one new file, with an optional fade, crossfade \
+        or silence between them. Mixed formats are fine. Never overwrites; returns the new file's path. \
+        Only combine when the user wants a file written.")]
+    async fn combine_files(&self, Parameters(args): Parameters<CombineArgs>) -> CallToolResult {
+        self.ui("combine_files", args).await
     }
 }
 

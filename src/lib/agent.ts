@@ -4,6 +4,7 @@
  */
 import type { History } from "../App";
 import * as E from "./edit";
+import * as C from "./combine";
 import { formatTime } from "./time";
 
 export interface AgentRequest {
@@ -30,6 +31,9 @@ export interface AgentContext {
   loaded: (paths: string[]) => Promise<PromiseSettledResult<{ duration: number }>[]>;
   focus: (path: string) => void;
   exportFile: (path: string, edit: E.Edit, duration: number, opts: ExportOptions) => Promise<string[]>;
+  /** Shows these clips and transition in the combine view. */
+  showCombine: (clips: C.CombineClip[], transition: C.Transition) => void;
+  combine: (specs: C.ClipSpec[], transition: C.Transition, opts: { format: string; outputDir: string }) => Promise<string>;
   activity: (text: string) => void;
 }
 
@@ -207,6 +211,43 @@ export async function handleAgentRequest({ tool, args }: AgentRequest, ctx: Agen
       const outputs = await ctx.exportFile(file, ctx.history(file).present, duration, opts);
       ctx.activity(`Exported ${outputs.length} file${outputs.length === 1 ? "" : "s"}`);
       return { outputs };
+    }
+
+    case "combine_files": {
+      const files = args.files;
+      if (!Array.isArray(files) || files.length < 2 || !files.every((f) => typeof f === "string" && f)) {
+        throw new Error('"files" must be a list of at least two absolute file paths, in output order');
+      }
+      const useEdits = (args.use_edits as boolean | undefined) ?? true;
+      const kind = (args.transition as string | undefined) ?? "none";
+      if (!C.TRANSITIONS.some((t) => t.kind === kind)) throw new Error(`"transition" must be one of ${C.TRANSITIONS.map((t) => t.kind).join(", ")}`);
+      const transition: C.Transition = { kind: kind as C.TransitionKind, seconds: (args.transition_seconds as number | undefined) ?? 1 };
+      const defaults = ctx.settings();
+      const format = (args.format as string | undefined) ?? defaults.format;
+      if (!FORMATS.includes(format)) throw new Error(`"format" must be one of ${FORMATS.join(", ")}`);
+      const outputDir = (args.output_dir as string | undefined) ?? defaults.outputDir;
+
+      const results = await ctx.open(files);
+      const specs = files.map((file, i) => {
+        const r = results[i];
+        if (r.status === "rejected") throw new Error(`Could not open ${file}: ${String(r.reason?.message ?? r.reason)}`);
+        return C.clipSpec(file, ctx.history(file).present, r.value.duration, useEdits);
+      });
+      const lengths = specs.map(C.clipLength);
+      const empty = lengths.findIndex((len) => len === 0);
+      if (empty >= 0) throw new Error(`${files[empty]} has every part removed; restore some or pass use_edits: false`);
+      const problem = C.transitionProblem(lengths, transition);
+      if (problem) throw new Error(`${problem}. Clip lengths: ${lengths.map(round).join(", ")} s`);
+
+      ctx.showCombine(files.map((f) => C.newClip(f, useEdits)), transition);
+      ctx.activity(`Combining ${files.length} clips…`);
+      const output = await ctx.combine(specs, transition, { format, outputDir });
+      ctx.activity(`Combined ${files.length} clips`);
+      return {
+        output,
+        duration: round(C.combinedLength(lengths, transition)),
+        clips: files.map((file, i) => ({ file, duration: round(lengths[i]), edited: useEdits && E.hasChanges(ctx.history(file).present) })),
+      };
     }
 
     default:

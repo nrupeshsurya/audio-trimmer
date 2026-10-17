@@ -73,6 +73,23 @@ async fn export_file(app: AppHandle, req: trim::ExportRequest) -> Result<Vec<Str
     Ok(outputs)
 }
 
+/// Joins clips from one or more files into a single new file; returns its path.
+#[tauri::command]
+async fn combine_files(app: AppHandle, req: trim::CombineRequest) -> Result<String, String> {
+    let mut formats = vec![];
+    for clip in &req.clips {
+        let (_, log) = run_ffmpeg(&app, &["-hide_banner", "-nostdin", "-i", &clip.input]).await?;
+        let format = trim::parse_stream_format(&log);
+        formats.push(format.ok_or_else(|| format!("Could not read {}:\n{}", clip.input, trim::tail(&log, 3)))?);
+    }
+    let job = trim::plan_combine(&req, &formats)?;
+    let (ok, log) = run_ffmpeg(&app, &job.args).await?;
+    if !ok {
+        return Err(format!("ffmpeg failed:\n{}", trim::tail(&log, 6)));
+    }
+    Ok(job.output.to_string_lossy().into_owned())
+}
+
 /// The UI's answer to an `agent-request` event.
 #[tauri::command]
 fn agent_respond(bridge: State<Arc<agent::Bridge>>, id: u64, ok: bool, result: Value) {
@@ -98,7 +115,7 @@ pub fn run() {
             tauri::async_runtime::spawn(agent::serve(bridge));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![load_waveform, export_file, agent_respond, agent_status])
+        .invoke_handler(tauri::generate_handler![load_waveform, export_file, combine_files, agent_respond, agent_status])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

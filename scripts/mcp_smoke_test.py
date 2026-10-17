@@ -2,7 +2,7 @@
 """End-to-end smoke test for a running Kusanagi, driven over MCP like an AI agent would.
 
 Generates a 20 s test file (tone, 4 s of silence, tone), then asks the app to find the
-silence, remove it and export, and checks the results with ffmpeg.
+silence, remove it and export, combine the edit with a second file, and checks the results with ffmpeg.
 
 Usage: python3 scripts/mcp_smoke_test.py --ffmpeg PATH [--workdir DIR]
 Uses only the standard library so it runs on a bare CI machine.
@@ -21,7 +21,7 @@ from pathlib import Path
 URL = "http://127.0.0.1:39231/mcp"
 EXPECTED_TOOLS = {
     "list_files", "open_files", "analyze_audio", "get_edit", "add_cuts", "remove_cut", "remove_range",
-    "keep_only_range", "set_part_removed", "undo", "clear_edits", "export",
+    "keep_only_range", "set_part_removed", "undo", "clear_edits", "export", "combine_files",
 }
 
 
@@ -118,6 +118,11 @@ def main() -> None:
         "-filter_complex", "[0][1][2]concat=n=3:v=0:a=1", str(source),
     ], check=True)
     print(f"Test file: {source} (6 s tone, 4 s silence, 10 s tone)")
+    jingle = workdir / "jingle.mp3"
+    subprocess.run([
+        args.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "sine=frequency=880:duration=5:sample_rate=48000", "-ac", "2", str(jingle),
+    ], check=True)
 
     wait_for_server(args.wait)
     client = McpClient(URL)
@@ -156,6 +161,17 @@ def main() -> None:
     lengths = [media_duration(args.ffmpeg, Path(p)) for p in parts]
     check(len(parts) == 2 and abs(lengths[0] - 6) < 0.1 and abs(lengths[1] - 10) < 0.1,
           f"separate MP3 export writes 6 s and 10 s files ({', '.join(f'{x:.2f}' for x in lengths)})")
+
+    combined = client.call("combine_files", files=[str(source), str(jingle)], transition="crossfade",
+                           transition_seconds=1, format="wav", output_dir=str(out_dir))
+    length = media_duration(args.ffmpeg, Path(combined["output"]))
+    check(abs(length - 20) < 0.1, f"combine_files joins the 16 s edit and a 5 s MP3 with a 1 s crossfade ({length:.3f} s)")
+
+    try:
+        client.call("combine_files", files=[str(source), str(jingle)], transition="crossfade", transition_seconds=10)
+        check(False, "too-long crossfade is rejected")
+    except RuntimeError as e:
+        check("too short" in str(e), "too-long crossfade is rejected with a helpful message")
 
     listed = client.call("list_files")
     check(any(f["file"] == str(source) and f["kept_parts"] == 2 for f in listed), "list_files reports the edit")

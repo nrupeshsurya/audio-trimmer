@@ -6,9 +6,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import Icon, { IconName } from "./components/Icon";
 import AgentPanel from "./components/AgentPanel";
+import CombinePanel, { ClipInfo } from "./components/CombinePanel";
+import OutputFields from "./components/OutputFields";
 import TimeInput from "./components/TimeInput";
 import Waveform, { Range } from "./components/Waveform";
 import * as E from "./lib/edit";
+import * as C from "./lib/combine";
 import { formatTime } from "./lib/time";
 import { AgentRequest, handleAgentRequest } from "./lib/agent";
 import "./App.css";
@@ -67,6 +70,27 @@ function ToolButton(props: { icon: IconName; label?: string; title: string; onCl
   );
 }
 
+/** The footer's running / saved / failed line for an export or combine. */
+function StatusLine({ status, running }: { status: ExportStatus | null | undefined; running: string }) {
+  if (status?.state === "running")
+    return (
+      <span>
+        <i className="spinner" /> {running}
+      </span>
+    );
+  if (status?.state === "done")
+    return (
+      <span className="ok-text">
+        Saved {plural(status.outputs.length, "file")}
+        <button className="link" onClick={() => revealItemInDir(status.outputs[0])}>
+          Show in folder
+        </button>
+      </span>
+    );
+  if (status?.state === "error") return <pre className="footer-error">{status.message}</pre>;
+  return null;
+}
+
 export default function App() {
   const [files, setFiles] = useState<string[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -85,6 +109,10 @@ export default function App() {
   const [precise, setPrecise] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [view, setView] = useState<"edit" | "combine">("edit");
+  const [clips, setClips] = useState<C.CombineClip[]>([]);
+  const [transition, setTransition] = useState<C.Transition>({ kind: "none", seconds: 1 });
+  const [combineStatus, setCombineStatus] = useState<ExportStatus | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   /** Waveform loads by path, so agent calls can wait for a file to finish loading. */
   const loads = useRef(new Map<string, Promise<{ peaks: Uint8Array; duration: number }>>());
@@ -103,6 +131,32 @@ export default function App() {
   const forcedPrecise = join && joinedSegments > 1;
   const editedFiles = files.filter((f) => audio[f]?.state === "ready" && histories[f] && E.hasChanges(histories[f].present));
   const status = active ? exports[active] : undefined;
+  const combining = view === "combine";
+
+  /** Each clip's spec once its file has loaded. */
+  const clipSpecs = clips.map((c) => {
+    const d = audio[c.path];
+    return d?.state === "ready" ? C.clipSpec(c.path, histories[c.path]?.present ?? E.EMPTY_EDIT, d.duration, c.useEdits) : null;
+  });
+  const clipLengths = clipSpecs.map((spec) => (spec ? C.clipLength(spec) : null));
+  const loadedLengths = clipLengths.filter((len): len is number => len !== null);
+  const combinedLength = loadedLengths.length === clips.length ? C.combinedLength(loadedLengths, transition) : null;
+  const clipInfo = (clip: C.CombineClip): ClipInfo => {
+    const d = audio[clip.path];
+    if (d?.state !== "ready") return { state: d?.state ?? "loading" };
+    const edit = histories[clip.path]?.present ?? E.EMPTY_EDIT;
+    return { state: "ready", length: clipLengths[clips.indexOf(clip)]!, hasEdits: E.hasChanges(edit) };
+  };
+  /** Why the clips can't be combined yet, or null. */
+  const combineProblem = (() => {
+    if (clips.length < 2) return "Add at least two clips";
+    const unreadable = clips.findIndex((c) => audio[c.path]?.state === "error");
+    if (unreadable >= 0) return `Clip ${unreadable + 1} can't be read`;
+    if (combinedLength === null) return "Waiting for clips to load…";
+    const empty = clipLengths.findIndex((len) => len === 0);
+    if (empty >= 0) return `Clip ${empty + 1} has every part removed`;
+    return C.transitionProblem(loadedLengths, transition);
+  })();
 
   // ---- Files ----
 
@@ -126,6 +180,7 @@ export default function App() {
   const removeFile = (path: string) => {
     const rest = files.filter((f) => f !== path);
     setFiles(rest);
+    setClips((cs) => cs.filter((c) => c.path !== path));
     if (active === path) setActive(rest[Math.min(files.indexOf(path), rest.length - 1)] ?? null);
   };
 
@@ -134,15 +189,33 @@ export default function App() {
     if (picked) addFiles(picked);
   };
 
+  const openFile = (path: string) => {
+    setActive(path);
+    setView("edit");
+  };
+
+  const addClips = (paths: string[]) => {
+    addFiles(paths);
+    setClips((cs) => [...cs, ...paths.map((p) => C.newClip(p, !!histories[p] && E.hasChanges(histories[p].present)))]);
+  };
+
+  const pickClips = async () => {
+    const picked = await open({ multiple: true, filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }] });
+    if (picked) addClips(picked);
+  };
+
   const pickOutputDir = async () => {
     const dir = await open({ directory: true });
     if (dir) setOutputDir(dir);
   };
 
+  // Files dropped on the combine screen become clips; elsewhere they are just opened.
+  const dropFiles = useRef(addFiles);
+  dropFiles.current = combining ? addClips : addFiles;
   useEffect(() => {
     const unlisten = getCurrentWebview().onDragDropEvent(({ payload }) => {
       setDragging(payload.type === "enter" || payload.type === "over");
-      if (payload.type === "drop") addFiles(payload.paths);
+      if (payload.type === "drop") dropFiles.current(payload.paths);
     });
     return () => void unlisten.then((fn) => fn());
   }, []);
@@ -154,7 +227,7 @@ export default function App() {
     setSelection(null);
     setSelectedCut(null);
     setPlaybackError(false);
-  }, [active]);
+  }, [active, view]);
 
   // ---- Editing with undo history ----
 
@@ -246,7 +319,7 @@ export default function App() {
 
   const onKey = useRef<(e: KeyboardEvent) => void>(() => {});
   onKey.current = (e) => {
-    if (!ready || (e.target instanceof Element && e.target.closest("input, textarea, select"))) return;
+    if (!ready || combining || (e.target instanceof Element && e.target.closest("input, textarea, select"))) return;
     const mod = e.metaKey || e.ctrlKey;
     const key = e.key.toLowerCase();
     if (mod && key === "z") {
@@ -318,6 +391,29 @@ export default function App() {
     setExporting(false);
   };
 
+  /** Combines clips into one new file and records the status; returns the written path or throws. */
+  const combineFiles = async (specs: C.ClipSpec[], t: C.Transition, opts: { format: string; outputDir: string }) => {
+    setCombineStatus({ state: "running" });
+    try {
+      const output = await invoke<string>("combine_files", { req: { clips: specs, transition: C.wireTransition(t), ...opts } });
+      setCombineStatus({ state: "done", outputs: [output] });
+      return output;
+    } catch (e) {
+      setCombineStatus({ state: "error", message: String(e) });
+      throw e;
+    }
+  };
+
+  const combineClips = async () => {
+    if (combineProblem) return;
+    setExporting(true);
+    await combineFiles(clipSpecs as C.ClipSpec[], transition, { format, outputDir }).catch(() => {});
+    setExporting(false);
+  };
+
+  // A finished or failed combine is stale once its inputs change.
+  useEffect(() => setCombineStatus((s) => (s?.state === "running" ? s : null)), [clips, transition, format, outputDir]);
+
   // ---- AI agents (MCP) ----
 
   // Agent calls arrive asynchronously, so they read the latest state through this ref.
@@ -342,6 +438,12 @@ export default function App() {
       loaded: (paths) => Promise.allSettled(paths.map((p) => loads.current.get(p)!)),
       focus: (path) => setActive(path),
       exportFile,
+      showCombine: (cs, t) => {
+        setClips(cs);
+        setTransition(t);
+        setView("combine");
+      },
+      combine: combineFiles,
       activity: setAgentActivity,
     });
 
@@ -371,6 +473,11 @@ export default function App() {
   return (
     <main className={`app ${dragging ? "dragging" : ""}`}>
       <aside className="sidebar">
+        <button className={`sidebar-nav ${combining ? "active" : ""}`} onClick={() => setView("combine")}>
+          <Icon name="layers" />
+          <span>Combine clips</span>
+          {clips.length > 0 && <span className="pill">{clips.length}</span>}
+        </button>
         <div className="sidebar-head">
           <h2>Files</h2>
           <button className="icon-btn" onClick={pickFiles} title="Add files">
@@ -388,7 +495,7 @@ export default function App() {
               const cuts = h?.cuts.length ?? 0;
               const removed = h?.removed.filter(Boolean).length ?? 0;
               return (
-                <li key={f} className={f === active ? "active" : ""} onClick={() => setActive(f)} title={f}>
+                <li key={f} className={f === active && !combining ? "active" : ""} onClick={() => openFile(f)} title={f}>
                   <div className="file-name">{fileName(f)}</div>
                   <div className="file-meta">
                     {d?.state === "loading" && <span>Loading…</span>}
@@ -423,7 +530,24 @@ export default function App() {
       </aside>
 
       <section className="workspace">
-        {!active ? (
+        {combining ? (
+          <CombinePanel
+            clips={clips}
+            info={clipInfo}
+            onClips={setClips}
+            files={files}
+            onAdd={addClips}
+            onChooseFiles={pickClips}
+            transition={transition}
+            onTransition={setTransition}
+            totalLength={combinedLength}
+            format={format}
+            onFormat={setFormat}
+            outputDir={outputDir}
+            onPickDir={pickOutputDir}
+            onClearDir={() => setOutputDir("")}
+          />
+        ) : !active ? (
           <button className="empty-state" onClick={pickFiles}>
             <Icon name="wave" size={32} />
             <strong>Drop audio files here</strong>
@@ -553,28 +677,14 @@ export default function App() {
                         File per part
                       </button>
                     </div>
-                    <div className="field">
-                      <span className="label">Format</span>
-                      <select value={format} onChange={(e) => setFormat(e.target.value)}>
-                        <option value="same">Same as input</option>
-                        <option value="mp3">MP3</option>
-                        <option value="m4a">M4A (AAC)</option>
-                        <option value="wav">WAV</option>
-                        <option value="flac">FLAC</option>
-                      </select>
-                    </div>
-                    <div className="field">
-                      <span className="label">Folder</span>
-                      <button className="path-btn" onClick={pickOutputDir} title={outputDir || "Choose output folder"}>
-                        <Icon name="folder" size={14} />
-                        <span>{outputDir ? fileName(outputDir) : "Next to original"}</span>
-                      </button>
-                      {outputDir && (
-                        <button className="icon-btn" onClick={() => setOutputDir("")} title="Save next to the original">
-                          <Icon name="close" size={12} />
-                        </button>
-                      )}
-                    </div>
+                    <OutputFields
+                      format={format}
+                      onFormat={setFormat}
+                      outputDir={outputDir}
+                      onPickDir={pickOutputDir}
+                      onClearDir={() => setOutputDir("")}
+                      source="original"
+                    />
                     <label
                       className="check"
                       title="Re-encodes so cuts land on the exact sample. Otherwise audio is copied losslessly, but MP3/AAC cuts can be off by about 25 ms. Joining several parts always re-encodes."
@@ -596,41 +706,46 @@ export default function App() {
       </section>
 
       <footer>
-        <div className="status">
-          {status?.state === "running" && (
-            <span>
-              <i className="spinner" /> Exporting…
-            </span>
-          )}
-          {status?.state === "done" && (
-            <span className="ok-text">
-              Saved {plural(status.outputs.length, "file")}
-              <button className="link" onClick={() => revealItemInDir(status.outputs[0])}>
-                Show in folder
+        {combining ? (
+          <>
+            <div className="status">
+              <StatusLine status={combineStatus} running="Combining…" />
+              {!combineStatus && (
+                <span className={combineProblem ? "dim" : ""}>
+                  {combineProblem ?? `${plural(clips.length, "clip")} · ${formatTime(combinedLength ?? 0)}`}
+                </span>
+              )}
+            </div>
+            <button className="primary" onClick={combineClips} disabled={exporting || !!combineProblem}>
+              {combineStatus?.state === "running" ? "Combining…" : "Combine"}
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="status">
+              <StatusLine status={status} running="Exporting…" />
+              {!status && ready && (
+                <span className="dim">
+                  {E.hasChanges(edit)
+                    ? `${plural(kept.length, "part")} kept · ${formatTime(keptDuration)} of ${formatTime(duration)}`
+                    : "Add a cut or select a range to start editing"}
+                </span>
+              )}
+            </div>
+            {editedFiles.length > 1 && (
+              <button className="secondary" onClick={() => exportMany(editedFiles)} disabled={exporting}>
+                Export all edited ({editedFiles.length})
               </button>
-            </span>
-          )}
-          {status?.state === "error" && <pre className="footer-error">{status.message}</pre>}
-          {!status && ready && (
-            <span className="dim">
-              {E.hasChanges(edit)
-                ? `${plural(kept.length, "part")} kept · ${formatTime(keptDuration)} of ${formatTime(duration)}`
-                : "Add a cut or select a range to start editing"}
-            </span>
-          )}
-        </div>
-        {editedFiles.length > 1 && (
-          <button className="secondary" onClick={() => exportMany(editedFiles)} disabled={exporting}>
-            Export all edited ({editedFiles.length})
-          </button>
+            )}
+            <button
+              className="primary"
+              onClick={() => active && exportMany([active])}
+              disabled={exporting || !ready || !E.hasChanges(edit) || kept.length === 0}
+            >
+              {exporting ? "Exporting…" : "Export"}
+            </button>
+          </>
         )}
-        <button
-          className="primary"
-          onClick={() => active && exportMany([active])}
-          disabled={exporting || !ready || !E.hasChanges(edit) || kept.length === 0}
-        >
-          {exporting ? "Exporting…" : "Export"}
-        </button>
       </footer>
 
       <audio

@@ -61,6 +61,10 @@ kbd { font: 11px var(--mono); padding: 0 4px; border: 1px solid var(--border-str
 .sidebar { display: flex; flex-direction: column; min-height: 0; background: var(--surface); border-right: 1px solid var(--border); }
 .sidebar-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 12px 8px 16px; }
 .sidebar-empty { padding: 8px 16px; color: var(--text-faint); }
+.sidebar-nav { display: flex; align-items: center; gap: 10px; margin: 12px 8px 0; padding: 8px 10px; background: none; border: 1px solid transparent; color: var(--text-dim); text-align: left; }
+.sidebar-nav span:first-of-type { flex: 1; }
+.sidebar-nav:hover { color: var(--text); background: var(--surface-2); }
+.sidebar-nav.active { color: var(--text); background: var(--surface-3); box-shadow: inset 2px 0 0 var(--accent); }
 
 .workspace { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; padding: 20px 24px; overflow-y: auto; }
 
@@ -87,7 +91,9 @@ button:focus-visible, select:focus-visible, input:focus-visible, li:focus-visibl
 .link { margin-left: 4px; padding: 2px 4px; background: none; border: none; color: var(--accent); }
 .link:hover { text-decoration: underline; }
 .icon-btn { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; background: none; border: 1px solid transparent; color: var(--text-dim); }
-.icon-btn:hover { color: var(--text); background: var(--surface-2); border-color: var(--border); }
+.icon-btn:hover:not(:disabled) { color: var(--text); background: var(--surface-2); border-color: var(--border); }
+.icon-btn:disabled { color: var(--text-faint); opacity: 0.5; }
+.icon-btn.danger:hover:not(:disabled) { color: var(--err); background: var(--err-bg); border-color: transparent; }
 
 /* ---------- File list ---------- */
 
@@ -114,6 +120,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, li:focus-visibl
 .file-title { min-width: 0; }
 .file-title h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-title p { margin-top: 2px; font: 11.5px var(--mono); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-title p.subtitle { font-family: inherit; font-size: 12px; color: var(--text-dim); }
 
 /* ---------- Toolbar ---------- */
 
@@ -207,6 +214,28 @@ select:hover { border-color: var(--border-strong); }
 .segmented button { flex: 1; padding: 5px 10px; background: none; border: none; color: var(--text-dim); }
 .segmented button:hover:not(.selected) { color: var(--text); background: var(--surface-3); }
 .segmented button.selected { background: var(--surface-3); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); font-weight: 500; }
+
+.segmented.small { padding: 2px; gap: 2px; border-radius: 6px; }
+.segmented.small button { padding: 2px 8px; font-size: 12px; border-radius: 4px; }
+.segmented button:disabled { color: var(--text-faint); cursor: default; }
+.segmented button:disabled:hover { background: none; color: var(--text-faint); }
+
+.card-note { margin-top: -4px; font-size: 12px; color: var(--text-faint); }
+.num-input { width: 72px; padding: 5px 8px; font: 12px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; }
+.num-input:hover { border-color: var(--border-strong); }
+.num-input:invalid { border-color: var(--err); }
+
+/* ---------- Combine ---------- */
+
+.clips { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 360px; overflow-y: auto; }
+.clip { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto 84px auto; align-items: center; gap: 10px; padding: 4px 6px 4px 8px; border-radius: 6px; transition: background 140ms; }
+.clip:hover { background: var(--surface-2); }
+.clip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clip .part-len { text-align: right; }
+.clip-actions { display: flex; gap: 2px; }
+.clips-empty { padding: 20px; text-align: center; color: var(--text-faint); border: 1.5px dashed var(--border); border-radius: 8px; }
+.clip-add { display: flex; gap: 8px; flex-wrap: wrap; }
+.clip-add select { min-width: 160px; }
 
 /* ---------- Status ---------- */
 

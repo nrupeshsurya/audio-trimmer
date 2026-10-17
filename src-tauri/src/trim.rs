@@ -35,6 +35,51 @@ pub struct ExportRequest {
     pub precise: bool,
 }
 
+/// One input of a combine: the parts of a file to use, in order.
+#[derive(Debug, Deserialize)]
+pub struct Clip {
+    pub input: String,
+    pub segments: Vec<Segment>,
+    /// The file's full length, used where a segment runs to the end.
+    pub duration: f64,
+}
+
+/// How consecutive clips are joined.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Transition {
+    /// Straight join.
+    None,
+    /// Fade out the end of each clip, then fade in the next.
+    Fade { seconds: f64 },
+    /// Overlap the end of each clip with the start of the next.
+    Crossfade { seconds: f64 },
+    /// Silence between clips.
+    Gap { seconds: f64 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CombineRequest {
+    /// Clips in output order. A file may appear more than once.
+    pub clips: Vec<Clip>,
+    pub transition: Transition,
+    /// Empty means "next to the first clip".
+    pub output_dir: String,
+    /// "same" (the first clip's format) or an output extension.
+    pub format: String,
+}
+
+/// What `combine` needs to know about an input's audio stream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamFormat {
+    pub sample_rate: u32,
+    pub mono: bool,
+}
+
+/// Longest fade, crossfade or gap between clips.
+pub const MAX_TRANSITION: f64 = 60.0;
+
 #[derive(Debug)]
 pub struct Job {
     pub args: Vec<String>,
@@ -253,6 +298,17 @@ fn parse_clock(text: &str) -> Option<f64> {
     Some(total)
 }
 
+/// Reads the first audio stream's sample rate and channel layout from the log of `ffmpeg -i FILE`,
+/// e.g. "Stream #0:0: Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 128 kb/s".
+pub fn parse_stream_format(log: &str) -> Option<StreamFormat> {
+    let (_, info) = log.lines().filter(|l| l.contains("Stream #")).find_map(|l| l.split_once(": Audio: "))?;
+    let fields: Vec<&str> = info.split(", ").collect();
+    let rate_at = fields.iter().position(|f| f.ends_with(" Hz"))?;
+    let sample_rate = fields[rate_at].trim_end_matches(" Hz").trim().parse().ok().filter(|&r| r > 0)?;
+    let layout = fields.get(rate_at + 1).copied().unwrap_or("");
+    Some(StreamFormat { sample_rate, mono: layout == "mono" || layout == "1 channels" })
+}
+
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
@@ -287,16 +343,156 @@ fn unique_path(dir: &Path, name: &str, ext: &str, taken: &mut HashSet<PathBuf>) 
     path
 }
 
+/// Index of the first segment that is out of order with itself or open-ended before the last.
+fn invalid_segment(segments: &[Segment]) -> Option<usize> {
+    segments.iter().enumerate().position(|(i, s)| {
+        let bad_end = s.end.is_some_and(|e| e <= s.start);
+        let not_last_open = s.end.is_none() && i + 1 != segments.len();
+        s.start < 0.0 || !s.start.is_finite() || bad_end || not_last_open
+    })
+}
+
+/// Filter text that trims `segments` out of input `input` and joins them with short fades.
+/// It ends in an unlabelled stream, so callers append more filters and an output label.
+/// Intermediate streams are labelled `[{prefix}{i}]`.
+fn segments_chain(input: usize, segments: &[Segment], prefix: &str) -> String {
+    let trim = |s: &Segment| {
+        let end = s.end.map(|e| format!(":end={e:.3}")).unwrap_or_default();
+        format!("[{input}:a]atrim=start={:.3}{end},asetpts=PTS-STARTPTS", s.start)
+    };
+    if let [only] = segments {
+        return trim(only);
+    }
+    let last = segments.len() - 1;
+    let mut filter = String::new();
+    let mut labels = String::new();
+    for (i, s) in segments.iter().enumerate() {
+        filter += &trim(s);
+        if i > 0 {
+            filter += &format!(",afade=t=in:d={JOIN_FADE}");
+        }
+        if let (true, Some(e)) = (i < last, s.end) {
+            if e - s.start > 2.0 * JOIN_FADE {
+                filter += &format!(",afade=t=out:st={:.3}:d={JOIN_FADE}", e - s.start - JOIN_FADE);
+            }
+        }
+        filter += &format!("[{prefix}{i}];");
+        labels += &format!("[{prefix}{i}]");
+    }
+    filter + &format!("{labels}concat=n={}:v=0:a=1", segments.len())
+}
+
+/// Plans one ffmpeg run that joins the clips into a single file. `formats[i]` describes clip `i`'s input;
+/// every clip is converted to the highest sample rate, and to stereo unless all inputs are mono.
+pub fn plan_combine(req: &CombineRequest, formats: &[StreamFormat]) -> Result<Job, String> {
+    if req.clips.len() < 2 {
+        return Err("Add at least two clips to combine".into());
+    }
+    if formats.len() != req.clips.len() {
+        return Err("Missing stream information for a clip".into());
+    }
+    let mut lengths = vec![];
+    for (k, clip) in req.clips.iter().enumerate() {
+        if clip.segments.is_empty() {
+            return Err(format!("Clip {} has nothing kept", k + 1));
+        }
+        if let Some(i) = invalid_segment(&clip.segments) {
+            return Err(format!("Clip {}: invalid part {}", k + 1, i + 1));
+        }
+        lengths.push(clip.segments.iter().map(|s| s.end.unwrap_or(clip.duration) - s.start).sum::<f64>());
+    }
+
+    let last = req.clips.len() - 1;
+    let seconds = match req.transition {
+        Transition::None => 0.0,
+        Transition::Fade { seconds } | Transition::Crossfade { seconds } | Transition::Gap { seconds } => seconds,
+    };
+    if !(0.0..=MAX_TRANSITION).contains(&seconds) || (seconds == 0.0 && req.transition != Transition::None) {
+        return Err(format!("Transition length must be more than 0 and at most {MAX_TRANSITION} seconds"));
+    }
+    if matches!(req.transition, Transition::Fade { .. } | Transition::Crossfade { .. }) {
+        for (k, len) in lengths.iter().enumerate() {
+            let ends = (k > 0) as u8 + (k < last) as u8;
+            if f64::from(ends) * seconds > *len {
+                return Err(format!(
+                    "Clip {} ({len:.2} s) is too short for a {seconds} s transition at {}",
+                    k + 1,
+                    if ends == 2 { "both ends" } else { "its end" }
+                ));
+            }
+        }
+    }
+
+    let first = Path::new(&req.clips[0].input);
+    let stem = first.file_stem().map(|s| s.to_string_lossy().into_owned()).ok_or("Clip 1 has no file name")?;
+    let ext = if req.format == "same" {
+        first
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .filter(|e| !e.is_empty())
+            .ok_or("Clip 1 has no extension; pick an output format")?
+    } else {
+        req.format.to_lowercase()
+    };
+    let out_dir = if req.output_dir.is_empty() {
+        first.parent().ok_or("Clip 1 has no parent folder")?.to_path_buf()
+    } else {
+        PathBuf::from(&req.output_dir)
+    };
+
+    let rate = formats.iter().map(|f| f.sample_rate).max().unwrap_or(48000);
+    let layout = if formats.iter().all(|f| f.mono) { "mono" } else { "stereo" };
+    let mut filter = String::new();
+    let mut labels = String::new();
+    for (k, clip) in req.clips.iter().enumerate() {
+        filter += &segments_chain(k, &clip.segments, &format!("s{k}_"));
+        filter += &format!(",aformat=sample_rates={rate}:channel_layouts={layout}");
+        match req.transition {
+            Transition::Fade { seconds: d } => {
+                if k > 0 {
+                    filter += &format!(",afade=t=in:d={d:.3}");
+                }
+                if k < last {
+                    filter += &format!(",afade=t=out:st={:.3}:d={d:.3}", lengths[k] - d);
+                }
+            }
+            Transition::Gap { seconds: d } if k < last => filter += &format!(",apad=pad_dur={d:.3}"),
+            _ => {}
+        }
+        filter += &format!("[c{k}];");
+        labels += &format!("[c{k}]");
+    }
+    if let Transition::Crossfade { seconds: d } = req.transition {
+        let mut prev = "[c0]".to_string();
+        for k in 1..=last {
+            let out = if k == last { "[out]".to_string() } else { format!("[x{k}]") };
+            filter += &format!("{prev}[c{k}]acrossfade=d={d:.3}{out};");
+            prev = out;
+        }
+        filter.pop();
+    } else {
+        filter += &format!("{labels}concat=n={}:v=0:a=1[out]", req.clips.len());
+    }
+
+    let output = unique_path(&out_dir, &format!("{stem}_combined"), &ext, &mut HashSet::new());
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()];
+    for clip in &req.clips {
+        args.extend(["-i".into(), clip.input.clone()]);
+    }
+    args.extend(["-filter_complex".into(), filter, "-map".into(), "[out]".into()]);
+    // Tags from any one clip (title, track number) would mislabel the combined file.
+    args.extend(["-map_metadata".into(), "-1".into()]);
+    args.extend(codec_args(&ext, false).into_iter().map(String::from));
+    args.push(output.to_string_lossy().into_owned());
+    Ok(Job { args, output })
+}
+
 pub fn plan(req: &ExportRequest) -> Result<Vec<Job>, String> {
     if req.segments.is_empty() {
         return Err("Nothing to export: every part is removed".into());
     }
-    for (i, s) in req.segments.iter().enumerate() {
-        let bad_end = s.end.is_some_and(|e| e <= s.start);
-        let not_last_open = s.end.is_none() && i + 1 != req.segments.len();
-        if s.start < 0.0 || !s.start.is_finite() || bad_end || not_last_open {
-            return Err(format!("Invalid part {}", i + 1));
-        }
+    if let Some(i) = invalid_segment(&req.segments) {
+        return Err(format!("Invalid part {}", i + 1));
     }
 
     let input = Path::new(&req.input);
@@ -325,24 +521,7 @@ pub fn plan(req: &ExportRequest) -> Result<Vec<Job>, String> {
     let base_args = || -> Vec<String> { vec!["-hide_banner".into(), "-nostdin".into(), "-y".into()] };
 
     if req.join && req.segments.len() > 1 {
-        let last = req.segments.len() - 1;
-        let mut filter = String::new();
-        let mut labels = String::new();
-        for (i, s) in req.segments.iter().enumerate() {
-            let end = s.end.map(|e| format!(":end={e:.3}")).unwrap_or_default();
-            filter += &format!("[0:a]atrim=start={:.3}{end},asetpts=PTS-STARTPTS", s.start);
-            if i > 0 {
-                filter += &format!(",afade=t=in:d={JOIN_FADE}");
-            }
-            if let (true, Some(e)) = (i < last, s.end) {
-                if e - s.start > 2.0 * JOIN_FADE {
-                    filter += &format!(",afade=t=out:st={:.3}:d={JOIN_FADE}", e - s.start - JOIN_FADE);
-                }
-            }
-            filter += &format!("[a{i}];");
-            labels += &format!("[a{i}]");
-        }
-        filter += &format!("{labels}concat=n={}:v=0:a=1[out]", req.segments.len());
+        let filter = segments_chain(0, &req.segments, "a") + "[out]";
 
         let output = unique_path(&out_dir, &format!("{stem}_edited"), &ext, &mut taken);
         let mut args = base_args();
@@ -476,6 +655,90 @@ mod tests {
         assert!(plan(&req(vec![seg(0.0, None), seg(10.0, Some(20.0))], false)).is_err());
     }
 
+    fn clip(input: &str, segments: Vec<Segment>, duration: f64) -> Clip {
+        Clip { input: input.into(), segments, duration }
+    }
+
+    fn combine(clips: Vec<Clip>, transition: Transition) -> CombineRequest {
+        CombineRequest { clips, transition, output_dir: String::new(), format: "same".into() }
+    }
+
+    const STEREO_48K: StreamFormat = StreamFormat { sample_rate: 48000, mono: false };
+    const MONO_44K: StreamFormat = StreamFormat { sample_rate: 44100, mono: true };
+
+    fn filter_of(job: &Job) -> &str {
+        &job.args[job.args.iter().position(|a| a == "-filter_complex").unwrap() + 1]
+    }
+
+    #[test]
+    fn combine_joins_clips_and_their_kept_parts() {
+        let r = combine(
+            vec![
+                clip("/nonexistent/dir/intro.mp3", vec![seg(0.0, None)], 10.0),
+                clip("/elsewhere/talk.wav", vec![seg(1.0, Some(2.0)), seg(3.0, None)], 5.0),
+            ],
+            Transition::None,
+        );
+        let job = plan_combine(&r, &[MONO_44K, STEREO_48K]).unwrap();
+        assert_eq!(
+            filter_of(&job),
+            "[0:a]atrim=start=0.000,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[c0];\
+             [1:a]atrim=start=1.000:end=2.000,asetpts=PTS-STARTPTS,afade=t=out:st=0.995:d=0.005[s1_0];\
+             [1:a]atrim=start=3.000,asetpts=PTS-STARTPTS,afade=t=in:d=0.005[s1_1];\
+             [s1_0][s1_1]concat=n=2:v=0:a=1,aformat=sample_rates=48000:channel_layouts=stereo[c1];\
+             [c0][c1]concat=n=2:v=0:a=1[out]"
+        );
+        assert!(has(&job.args, ["-i", "/nonexistent/dir/intro.mp3"]) && has(&job.args, ["-i", "/elsewhere/talk.wav"]));
+        assert!(has(&job.args, ["-map_metadata", "-1"]));
+        assert!(job.args.contains(&"libmp3lame".to_string()));
+        assert!(job.output.ends_with("dir/intro_combined.mp3"));
+    }
+
+    #[test]
+    fn combine_transitions() {
+        let clips = || vec![clip("/x/a.wav", vec![seg(0.0, None)], 10.0), clip("/x/b.wav", vec![seg(2.0, Some(8.0))], 9.0), clip("/x/c.wav", vec![seg(0.0, None)], 4.0)];
+        let fmt = [MONO_44K; 3];
+        let aformat = "aformat=sample_rates=44100:channel_layouts=mono";
+
+        let fade = plan_combine(&combine(clips(), Transition::Fade { seconds: 1.5 }), &fmt).unwrap();
+        let f = filter_of(&fade);
+        assert!(f.contains(&format!("PTS-STARTPTS,{aformat},afade=t=out:st=8.500:d=1.500[c0]")));
+        assert!(f.contains(&format!("{aformat},afade=t=in:d=1.500,afade=t=out:st=4.500:d=1.500[c1]")));
+        assert!(f.contains(&format!("{aformat},afade=t=in:d=1.500[c2]")));
+
+        let gap = plan_combine(&combine(clips(), Transition::Gap { seconds: 2.0 }), &fmt).unwrap();
+        assert_eq!(filter_of(&gap).matches("apad=pad_dur=2.000").count(), 2);
+        assert!(filter_of(&gap).ends_with("[c0][c1][c2]concat=n=3:v=0:a=1[out]"));
+
+        let xfade = plan_combine(&combine(clips(), Transition::Crossfade { seconds: 2.0 }), &fmt).unwrap();
+        assert!(filter_of(&xfade).ends_with("[c0][c1]acrossfade=d=2.000[x1];[x1][c2]acrossfade=d=2.000[out]"));
+    }
+
+    #[test]
+    fn combine_rejects_bad_requests() {
+        let a = || clip("/x/a.wav", vec![seg(0.0, None)], 10.0);
+        let short = || clip("/x/b.wav", vec![seg(0.0, None)], 3.0);
+        let fmt = [MONO_44K; 3];
+        let err = |r: CombineRequest| plan_combine(&r, &fmt[..r.clips.len()]).unwrap_err();
+        assert!(err(combine(vec![a()], Transition::None)).contains("at least two"));
+        assert!(err(combine(vec![a(), clip("/x/b.wav", vec![], 3.0)], Transition::None)).contains("Clip 2 has nothing kept"));
+        assert!(err(combine(vec![a(), a()], Transition::Gap { seconds: 0.0 })).contains("Transition length"));
+        assert!(err(combine(vec![a(), a()], Transition::Fade { seconds: f64::NAN })).contains("Transition length"));
+        // The middle clip fades at both ends: 2 × 2 s > 3 s. As the last clip it only needs 2 s.
+        assert!(err(combine(vec![a(), short(), a()], Transition::Crossfade { seconds: 2.0 })).contains("Clip 2 (3.00 s)"));
+        assert!(plan_combine(&combine(vec![a(), short()], Transition::Crossfade { seconds: 2.0 }), &fmt[..2]).is_ok());
+    }
+
+    #[test]
+    fn parses_stream_format() {
+        let log = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.m4a':\n  Duration: 00:00:10.00, start: 0.000000, bitrate: 130 kb/s\n\
+                   \x20 Stream #0:0[0x1](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 128 kb/s (default)\n";
+        assert_eq!(parse_stream_format(log), Some(StreamFormat { sample_rate: 44100, mono: false }));
+        let log = "  Stream #0:1: Video: mjpeg, yuvj420p, 600x600\n  Stream #0:0: Audio: mp3 (mp3float), 22050 Hz, mono, fltp, 64 kb/s\n";
+        assert_eq!(parse_stream_format(log), Some(StreamFormat { sample_rate: 22050, mono: true }));
+        assert_eq!(parse_stream_format("a.txt: Invalid data found when processing input"), None);
+    }
+
     #[test]
     fn parses_analysis_log() {
         // Each RMS line is one 0.5 s analysis step.
@@ -563,6 +826,47 @@ mod tests {
                 // mp3 adds encoder padding of a frame or two.
                 assert!((got - want).abs() < 0.06, "{} is {got}s, want {want}s", job.output.display());
             }
+        }
+
+        // Combine a mono 44.1 kHz MP3 with a stereo 48 kHz WAV.
+        let tone = |path: &Path, opts: [&str; 4]| {
+            let mut args = make_tone[..make_tone.len() - 1].to_vec();
+            args.extend(opts.map(String::from));
+            args.push(path.to_string_lossy().into());
+            assert!(run(&args).status.success());
+        };
+        let probe = |path: &Path| {
+            let out = run(&["-hide_banner".into(), "-i".into(), path.to_string_lossy().into()]);
+            parse_stream_format(&String::from_utf8_lossy(&out.stderr)).unwrap()
+        };
+        let (mono, stereo) = (dir.join("mono.mp3"), dir.join("stereo.wav"));
+        tone(&mono, ["-ar", "44100", "-ac", "1"]);
+        tone(&stereo, ["-ar", "48000", "-ac", "2"]);
+        let formats = [probe(&mono), probe(&stereo)];
+        assert_eq!(formats, [StreamFormat { sample_rate: 44100, mono: true }, StreamFormat { sample_rate: 48000, mono: false }]);
+
+        // 10 s mono + kept 3 s of stereo (1-2 s and 8-10 s).
+        let transitions = [
+            (Transition::None, 13.0),
+            (Transition::Fade { seconds: 1.0 }, 13.0),
+            (Transition::Crossfade { seconds: 1.0 }, 12.0),
+            (Transition::Gap { seconds: 2.0 }, 15.0),
+        ];
+        for (transition, want) in transitions {
+            let mut r = combine(
+                vec![
+                    clip(&mono.to_string_lossy(), vec![seg(0.0, None)], 10.0),
+                    clip(&stereo.to_string_lossy(), vec![seg(1.0, Some(2.0)), seg(8.0, None)], 10.0),
+                ],
+                transition,
+            );
+            r.format = "wav".into();
+            let job = plan_combine(&r, &formats).unwrap();
+            let out = run(&job.args);
+            assert!(out.status.success(), "{}", tail(&String::from_utf8_lossy(&out.stderr), 5));
+            let got = duration_of(&job.output);
+            assert!((got - want).abs() < 0.06, "{transition:?}: {got}s, want {want}s");
+            assert_eq!(probe(&job.output), StreamFormat { sample_rate: 48000, mono: false });
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

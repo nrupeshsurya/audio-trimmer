@@ -52,6 +52,7 @@ Then ask things like *"Open ~/Downloads/podcast.mp3, remove the long silences an
 | `set_part_removed` | Remove or restore one part |
 | `undo`, `clear_edits` | Undo the last edit, or start over |
 | `export` | Write the kept parts (joined or one file per part); never overwrites |
+| `combine_files` | Join several files (or their kept parts) into one, with no transition, a fade, a crossfade or a gap |
 
 The server only accepts connections from this machine and rejects requests from web pages, so websites can't drive the app.
 
